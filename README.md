@@ -1,4 +1,4 @@
-# Funding Match System
+# Funding Matcher
 
 Runnable backend prototype for:
 
@@ -15,7 +15,6 @@ from environment variables and are never written to the database.
 ## Quick start
 
 ```bash
-cd funding_match_system
 python run_pipeline.py demo --reset
 ```
 
@@ -24,7 +23,7 @@ This creates:
 - `data/funding_match.db`
 - `output/demo_matches.csv`
 
-## Key-free preview using Xin Yuan's profile
+## Key-free preview using Xin's profile
 
 No API key is needed. The profile and a small, dated opportunity snapshot are
 plain JSON files so they can be reviewed before connecting institutional data.
