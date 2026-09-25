@@ -240,25 +240,25 @@ with st.form("researcher-form"):
     st.caption("The first theme is required. Leave theme 2 or 3 blank if not needed.")
     defaults = [
         (
-            "Interpretable AI for longitudinal electronic health records",
+            "Interpretable embedding for longitudinal EHRs",
             "Machine learning, language-model embeddings and interpretable representation learning for longitudinal EHR, phecodes, clinical trajectories and cancer risk prediction.",
-            "EHR, electronic health records, machine learning, embeddings, cancer risk",
+            "EHR, electronic health records, machine learning, embeddings",
             "machine learning, artificial intelligence, natural language processing",
             "cancer", "patients", "EHR, clinical data",
         ),
         (
             "Statistical genetics and multi-omics",
-            "GWAS, statistical genetics, causal inference and integration of multi-omics with phenotypes in population biobanks.",
-            "GWAS, statistical genetics, functional genomics, multi-omics, biobank",
+            "GWAS, statistical genetics, using segmentation as a quantitative phenotype.",
+            "GWAS, statistical genetics, functional genomics, multi-omics, biobank, MRI image",
             "statistical genetics, causal inference, bioinformatics",
             "complex disease", "population biobank", "genomics, multi-omics, biobank",
         ),
         (
-            "AI medical imaging for oral cancer and abdominal MRI",
-            "Deep-learning classification and segmentation for oral cancer, potentially malignant disorders and quantitative abdominal MRI.",
-            "medical imaging, segmentation, oral cancer, MRI, deep learning",
+            "AI medical imaging for oral cancer",
+            "Deep-learning classification and segmentation for oral cancer, potentially malignant disorders.",
+            "medical imaging, segmentation, oral cancer, deep learning",
             "deep learning, imaging, segmentation",
-            "oral cancer", "patients", "imaging, MRI",
+            "oral cancer", "patients", "imaging",
         ),
     ]
     entered_themes = []
