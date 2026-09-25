@@ -26,7 +26,7 @@
   "themes": [
     {
       "theme_id": "xin-ehr-ai",
-      "theme_name": "Interpretable embedding for longitudinal EHR",
+      "theme_name": "Interpretable AI for longitudinal electronic health records",
       "summary": "Machine learning, large language model embeddings and interpretable representation learning for longitudinal EHR, phecodes, clinical trajectories and cancer risk prediction.",
       "keywords": ["electronic health records", "EHR", "machine learning", "artificial intelligence", "embeddings", "cancer risk", "clinical data"],
       "methods": ["machine learning", "artificial intelligence", "natural language processing"],

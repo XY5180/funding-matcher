@@ -76,7 +76,7 @@ def run_match(profile, themes):
         conn.commit()
         match_all(conn)
 
-        rows = conn.execute("""
+        opportunity_rows = conn.execute("""
             SELECT m.scientific_fit, m.eligibility_status,
                    m.eligibility_reasons, m.matched_terms, m.explanation,
                    t.theme_name, o.opportunity_number, o.title, o.agency,
@@ -89,7 +89,22 @@ def run_match(profile, themes):
                        WHEN 'eligible' THEN 0 WHEN 'review' THEN 1 ELSE 2 END,
                      m.scientific_fit DESC
         """).fetchall()
-        return [dict(row) for row in rows], snapshot["snapshot_date"]
+        theme_rows = conn.execute("""
+            SELECT tm.scientific_fit, tm.eligibility_status,
+                   tm.eligibility_reasons, tm.matched_terms, tm.explanation,
+                   t.theme_name, t.theme_id, o.opportunity_number, o.title,
+                   o.agency, o.close_date, o.source_url
+            FROM theme_matches tm
+            JOIN opportunities o USING(opportunity_id)
+            JOIN research_themes t USING(theme_id)
+            WHERE tm.researcher_id='web-form-researcher'
+            ORDER BY t.theme_name,
+                     CASE tm.eligibility_status
+                       WHEN 'eligible' THEN 0 WHEN 'review' THEN 1 ELSE 2 END,
+                     tm.scientific_fit DESC
+        """).fetchall()
+        return ([dict(row) for row in opportunity_rows],
+                [dict(row) for row in theme_rows], snapshot["snapshot_date"])
 
 
 def render_results(rows, snapshot_date):
@@ -137,6 +152,67 @@ def render_results(rows, snapshot_date):
         file_name="funding_matches.csv",
         mime="text/csv",
     )
+
+
+def render_theme_results(rows, top_k, minimum_fit):
+    st.subheader("Top funding matches by research theme")
+    st.caption(
+        "Each theme is scored against every opportunity. Results below are "
+        "ranked independently within each theme."
+    )
+    themes = []
+    for row in rows:
+        if row["theme_name"] not in themes:
+            themes.append(row["theme_name"])
+    selected = []
+    for theme_name in themes:
+        eligible_rows = [
+            row for row in rows
+            if row["theme_name"] == theme_name
+            and row["scientific_fit"] >= minimum_fit
+        ][:top_k]
+        st.markdown(f"### {theme_name}")
+        if not eligible_rows:
+            st.warning("No opportunities meet the selected minimum fit.")
+            continue
+        for rank, row in enumerate(eligible_rows, start=1):
+            selected.append(row)
+            reasons = json.loads(row["eligibility_reasons"] or "[]")
+            matched = json.loads(row["matched_terms"] or "[]")
+            with st.container(border=True):
+                left, right = st.columns([4, 1])
+                with left:
+                    st.markdown(f"**{rank}. {row['title']}**")
+                    st.write(
+                        f"{row['opportunity_number']} · {row['agency']} · "
+                        f"Deadline: {row['close_date'] or 'verify'}"
+                    )
+                with right:
+                    st.metric("Scientific fit", f"{row['scientific_fit']:.1f}/100")
+                st.write(f"**Eligibility:** {row['eligibility_status'].upper()}")
+                if reasons:
+                    st.info("Human review: " + "; ".join(reasons))
+                st.write("**Matched terms:** " + (", ".join(matched) or "None"))
+                st.link_button("Open official announcement", row["source_url"],
+                               key=f"theme-link-{row['theme_id']}-{row['opportunity_number']}")
+
+    if selected:
+        import csv
+        import io
+        export_rows = []
+        for row in selected:
+            export_rows.append({
+                **row,
+                "eligibility_reasons": "; ".join(json.loads(row["eligibility_reasons"] or "[]")),
+                "matched_terms": "; ".join(json.loads(row["matched_terms"] or "[]")),
+            })
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=export_rows[0].keys())
+        writer.writeheader(); writer.writerows(export_rows)
+        st.download_button(
+            "Download theme-based results as CSV", output.getvalue(),
+            file_name="funding_matches_by_theme.csv", mime="text/csv",
+        )
 
 
 st.set_page_config(page_title="Funding Match", page_icon="🔎", layout="wide")
@@ -205,6 +281,13 @@ with st.form("researcher-form"):
                 "data_types": split_terms(data_types),
             })
 
+    st.subheader("3. Result settings")
+    settings_col1, settings_col2 = st.columns(2)
+    with settings_col1:
+        top_k = st.selectbox("Recommendations per theme", [3, 5, 10], index=1)
+    with settings_col2:
+        minimum_fit = st.selectbox("Minimum scientific fit", [0, 10, 20, 30, 40], index=0)
+
     submitted = st.form_submit_button("Find funding opportunities", type="primary")
 
 if submitted:
@@ -222,15 +305,22 @@ if submitted:
             "works_with_animals": tri_state[animal_answer],
         }
         try:
-            rows, snapshot_date = run_match(profile, valid_themes)
-            st.session_state["match_results"] = (rows, snapshot_date)
+            opportunity_rows, theme_rows, snapshot_date = run_match(profile, valid_themes)
+            st.session_state["match_results"] = (
+                opportunity_rows, theme_rows, snapshot_date, top_k, minimum_fit)
         except Exception as exc:
             st.exception(exc)
 
 if "match_results" in st.session_state:
-    result_rows, result_snapshot = st.session_state["match_results"]
+    result_rows, theme_rows, result_snapshot, result_top_k, result_minimum = st.session_state["match_results"]
     if result_rows:
-        render_results(result_rows, result_snapshot)
+        st.caption(f"Funding snapshot: {result_snapshot}")
+        theme_tab, opportunity_tab = st.tabs([
+            "Top matches by research theme", "Best theme for each opportunity"
+        ])
+        with theme_tab:
+            render_theme_results(theme_rows, result_top_k, result_minimum)
+        with opportunity_tab:
+            render_results(result_rows, result_snapshot)
     else:
         st.warning("No matching opportunities were found in the current snapshot.")
-

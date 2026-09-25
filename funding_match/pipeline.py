@@ -359,10 +359,31 @@ def match_all(conn):
     df = Counter(t for doc in docs for t in doc)
     idf = {t: math.log((1+len(docs))/(1+n))+1 for t,n in df.items()}
     best = {}
+    conn.execute("DELETE FROM theme_matches")
     for theme in themes:
         researcher = researchers[theme["researcher_id"]]
         for opp in opportunities:
             fit = weighted_fit(theme, opp, idf)
+            status, reasons = eligibility(researcher, opp)
+            score, topic, method, domain, evidence, shared = fit
+            pair_row = {
+                "researcher_id": researcher["researcher_id"],
+                "opportunity_id": opp["opportunity_id"],
+                "theme_id": theme["theme_id"],
+                "eligibility_status": status,
+                "eligibility_reasons": reasons,
+                "scientific_fit": round(score, 1),
+                "topic_score": round(topic, 1),
+                "method_score": None if method is None else round(method, 1),
+                "domain_score": None if domain is None else round(domain, 1),
+                "evidence_score": round(evidence, 1),
+                "matched_terms": shared,
+                "explanation": f"Theme: {theme['theme_name']}. Shared evidence terms: {', '.join(shared) or 'none'}.",
+                "model_version": "transparent-tfidf-v1",
+                "scored_at": utcnow(),
+            }
+            upsert(conn, "theme_matches", pair_row,
+                   ["researcher_id", "opportunity_id", "theme_id"])
             key = (researcher["researcher_id"], opp["opportunity_id"])
             if key not in best or fit[0] > best[key][0][0]:
                 best[key] = (fit, theme, researcher, opp)
@@ -380,6 +401,31 @@ def match_all(conn):
         upsert(conn, "matches", row, ["researcher_id","opportunity_id"])
     conn.commit()
     return len(best)
+
+def export_theme_matches(conn, output, top_k=None, minimum_fit=0):
+    """Export ranked funding opportunities for every research theme."""
+    output = Path(output); output.parent.mkdir(parents=True, exist_ok=True)
+    rows = conn.execute("""SELECT r.name,t.theme_name,tm.*,o.opportunity_number,
+                          o.title,o.agency,o.status,o.close_date,o.award_ceiling,o.source_url
+                          FROM theme_matches tm
+                          JOIN researchers r USING(researcher_id)
+                          JOIN research_themes t USING(theme_id)
+                          JOIN opportunities o USING(opportunity_id)
+                          WHERE tm.scientific_fit >= ?
+                          ORDER BY r.name,t.theme_name,
+                          CASE tm.eligibility_status WHEN 'eligible' THEN 0
+                          WHEN 'review' THEN 1 ELSE 2 END,
+                          tm.scientific_fit DESC""", (minimum_fit,)).fetchall()
+    selected, counts = [], defaultdict(int)
+    for row in rows:
+        key = (row["researcher_id"], row["theme_id"])
+        if top_k is None or counts[key] < top_k:
+            selected.append(row); counts[key] += 1
+    if not selected: return 0
+    with output.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=selected[0].keys())
+        writer.writeheader(); writer.writerows(dict(r) for r in selected)
+    return len(selected)
 
 def export_matches(conn, output):
     output = Path(output); output.parent.mkdir(parents=True, exist_ok=True)

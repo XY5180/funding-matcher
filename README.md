@@ -23,7 +23,7 @@ This creates:
 - `data/funding_match.db`
 - `output/demo_matches.csv`
 
-## Key-free preview using Xin's profile
+## Key-free preview using Xin Yuan's profile
 
 No API key is needed. The profile and a small, dated opportunity snapshot are
 plain JSON files so they can be reviewed before connecting institutional data.
@@ -33,12 +33,35 @@ python run_pipeline.py quick-xin-demo --reset
 ```
 
 Open `output/xin_quick_report.html` for a readable ranked report, or use
-`output/xin_quick_matches.csv` for analysis. Edit `quick_profile.json` to
+`output/xin_quick_matches.csv` for the best theme per opportunity and
+`output/xin_theme_matches.csv` for multiple opportunities per theme. Edit `quick_profile.json` to
 correct the profile. `quick_opportunities.json` is a 2026-09-25 snapshot from
 official announcement pages and must be re-checked before applying.
 
 Later, API sync replaces these two manual inputs; the matching and export
 stages stay the same.
+
+## Web interface
+
+Install the small web dependency and start the interface:
+
+```bash
+python -m pip install -r requirements.txt
+python -m streamlit run app.py
+```
+
+The browser form supports up to three research themes, displays scientific fit
+separately from eligibility review, links to each official announcement, and
+downloads the results as CSV. It provides both a theme-centric Top-K view and
+an opportunity-centric best-theme view. It uses the same `funding_match/` backend as
+`run_pipeline.py`; neither entry point replaces the other.
+
+The command-line version can export the Top 5 opportunities for every theme:
+
+```bash
+python run_pipeline.py export-theme-matches \
+  --top-k 5 --minimum-fit 0 --output output/theme_matches.csv
+```
 
 ## Real API configuration
 

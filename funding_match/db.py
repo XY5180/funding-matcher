@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS matches(
   domain_score REAL, evidence_score REAL, matched_terms TEXT,
   explanation TEXT, model_version TEXT, scored_at TEXT,
   PRIMARY KEY(researcher_id, opportunity_id));
+CREATE TABLE IF NOT EXISTS theme_matches(
+  researcher_id TEXT, opportunity_id TEXT, theme_id TEXT,
+  eligibility_status TEXT, eligibility_reasons TEXT,
+  scientific_fit REAL, topic_score REAL, method_score REAL,
+  domain_score REAL, evidence_score REAL, matched_terms TEXT,
+  explanation TEXT, model_version TEXT, scored_at TEXT,
+  PRIMARY KEY(researcher_id, opportunity_id, theme_id));
 CREATE TABLE IF NOT EXISTS match_feedback(
   researcher_id TEXT, opportunity_id TEXT, label TEXT, reason TEXT,
   created_at TEXT, PRIMARY KEY(researcher_id, opportunity_id, created_at));
@@ -75,4 +82,3 @@ def upsert(conn, table, row, conflict):
     sql = (f"INSERT INTO {table} ({','.join(columns)}) VALUES ({placeholders}) "
            f"ON CONFLICT({','.join(conflict)}) DO UPDATE SET {updates}")
     conn.execute(sql, [clean[c] for c in columns])
-

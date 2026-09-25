@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 
 from funding_match.db import connect, upsert
-from funding_match.pipeline import (build_profiles, export_matches, match_all,
+from funding_match.pipeline import (build_profiles, export_matches, export_theme_matches, match_all,
                                     sync_grants, sync_pure, sync_scopus,
                                     import_feedback, evaluation_report)
 from funding_match.clients import utcnow
@@ -129,6 +129,10 @@ def main():
     sub.add_parser("build-profiles")
     sub.add_parser("match")
     export=sub.add_parser("export"); export.add_argument("--output",default="output/matches.csv")
+    theme_export=sub.add_parser("export-theme-matches")
+    theme_export.add_argument("--output",default="output/theme_matches.csv")
+    theme_export.add_argument("--top-k",type=int,default=5)
+    theme_export.add_argument("--minimum-fit",type=float,default=0)
     feedback=sub.add_parser("import-feedback"); feedback.add_argument("--input",required=True)
     evaluate=sub.add_parser("evaluate"); evaluate.add_argument("--k",type=int,default=10)
     args=parser.parse_args()
@@ -148,10 +152,14 @@ def main():
                 conn, ROOT/"quick_profile.json", ROOT/"quick_opportunities.json")
             pairs=match_all(conn)
             csv_out=ROOT/"output/xin_quick_matches.csv"
+            theme_csv_out=ROOT/"output/xin_theme_matches.csv"
             html_out=ROOT/"output/xin_quick_report.html"
-            export_matches(conn,csv_out); export_quick_html(conn,html_out)
+            export_matches(conn,csv_out)
+            export_theme_matches(conn,theme_csv_out,top_k=5,minimum_fit=0)
+            export_quick_html(conn,html_out)
             result=(f"Quick demo complete: {themes} verified themes, {opportunities} opportunities, "
-                    f"{pairs} matched pairs\nCSV: {csv_out}\nReport: {html_out}")
+                    f"{pairs} opportunity-level matches\nBest-theme CSV: {csv_out}"
+                    f"\nTheme Top-K CSV: {theme_csv_out}\nReport: {html_out}")
         elif args.command=="sync-pure": result=sync_pure(conn,cfg)
         elif args.command=="sync-scopus": result=f"{sync_scopus(conn,cfg)} publication links"
         elif args.command=="sync-grants": result=f"{sync_grants(conn,cfg,args.query)} opportunities"
@@ -161,6 +169,11 @@ def main():
             result=f"{import_feedback(conn,args.input)} feedback labels imported"
         elif args.command=="evaluate":
             result=json.dumps(evaluation_report(conn,args.k),indent=2)
+        elif args.command=="export-theme-matches":
+            target=Path(args.output)
+            if not target.is_absolute(): target=ROOT/target
+            result=(f"{export_theme_matches(conn,target,args.top_k,args.minimum_fit)} rows "
+                    f"written to {target}")
         else:
             target=Path(args.output)
             if not target.is_absolute(): target=ROOT/target
