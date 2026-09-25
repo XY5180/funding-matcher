@@ -1,0 +1,6 @@
+researcher_id,opportunity_id,label,reason
+R1,G1,strong_match,Research topic and methods align
+R1,G2,not_eligible,Faculty appointment required
+R2,G1,not_relevant,Outside current research direction
+R2,G2,strong_match,Directly aligned with statistical genetics program
+

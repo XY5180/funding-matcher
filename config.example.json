@@ -1,0 +1,28 @@
+{
+  "database": "data/funding_match.db",
+  "pure": {
+    "base_url": "https://YOUR-INSTITUTION.example/ws/api/524",
+    "api_key_env": "PURE_API_KEY",
+    "page_size": 100,
+    "endpoints": {
+      "persons": "/persons",
+      "research_outputs": "/research-outputs",
+      "organizations": "/organisational-units",
+      "projects": "/projects"
+    }
+  },
+  "scopus": {
+    "base_url": "https://api.elsevier.com/content",
+    "api_key_env": "SCOPUS_API_KEY",
+    "institution_token_env": "SCOPUS_INST_TOKEN",
+    "publication_start_year": 2019
+  },
+  "simpler_grants": {
+    "base_url": "https://api.simpler.grants.gov",
+    "api_key_env": "SIMPLER_GRANTS_API_KEY",
+    "page_size": 100,
+    "max_pages": 10,
+    "statuses": ["posted", "forecasted"]
+  }
+}
+

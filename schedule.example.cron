@@ -1,0 +1,9 @@
+# Run from the project directory. Configure server secrets before enabling.
+# Daily opportunity sync at 02:10, followed by profile scoring.
+10 2 * * * cd /path/to/funding_match_system && python3 run_pipeline.py --config config.json sync-grants >> logs/sync.log 2>&1
+30 2 * * * cd /path/to/funding_match_system && python3 run_pipeline.py --config config.json match >> logs/match.log 2>&1
+
+# Weekly Pure/Scopus refresh on Sunday.
+10 3 * * 0 cd /path/to/funding_match_system && python3 run_pipeline.py --config config.json sync-pure >> logs/pure.log 2>&1
+40 3 * * 0 cd /path/to/funding_match_system && python3 run_pipeline.py --config config.json sync-scopus >> logs/scopus.log 2>&1
+30 5 * * 0 cd /path/to/funding_match_system && python3 run_pipeline.py --config config.json build-profiles >> logs/profile.log 2>&1

@@ -1,0 +1,64 @@
+{
+  "organization": {
+    "organization_id": "PSU-COM",
+    "name": "Penn State College of Medicine",
+    "type": "higher_education",
+    "parent_organization_id": null,
+    "raw_json": {"source": "key-free quick demo; replace with Pure later"},
+    "updated_at": "2026-09-25T00:00:00Z"
+  },
+  "researcher": {
+    "researcher_id": "xin-yuan-quick-demo",
+    "pure_person_id": null,
+    "scopus_author_id": null,
+    "orcid": null,
+    "name": "Xin Yuan",
+    "email": "",
+    "title": "Postdoctoral Researcher",
+    "career_stage": "postdoc",
+    "country": "US",
+    "organization_id": "PSU-COM",
+    "independent_pi": 0,
+    "works_with_animals": null,
+    "profile_updated_at": "2026-09-25T00:00:00Z",
+    "raw_json": {"source": "manually supplied quick profile"}
+  },
+  "themes": [
+    {
+      "theme_id": "xin-ehr-ai",
+      "theme_name": "Interpretable embedding for longitudinal electronic health records",
+      "summary": "Machine learning, large language model embeddings and interpretable representation learning for longitudinal EHR, phecodes, clinical trajectories and cancer risk prediction.",
+      "keywords": ["electronic health records", "EHR", "machine learning", "artificial intelligence", "embeddings", "cancer risk", "clinical data"],
+      "methods": ["machine learning", "artificial intelligence", "natural language processing"],
+      "diseases": ["cancer"],
+      "populations": ["patients"],
+      "data_types": ["electronic health records", "clinical data"],
+      "evidence_output_ids": [],
+      "confidence": 0.85
+    },
+    {
+      "theme_id": "xin-genomics",
+      "theme_name": "Statistical genetics and multi-omics",
+      "summary": "GWAS, statistical genetics, causal inference, functional genomics and integration of multi-omics with phenotypes in population biobanks.",
+      "keywords": ["GWAS", "statistical genetics", "functional genomics", "multi-omics", "biobank", "phenotypes"],
+      "methods": ["statistical genetics", "causal inference", "bioinformatics"],
+      "diseases": ["complex disease"],
+      "populations": ["population biobank"],
+      "data_types": ["genomics", "multi-omics", "biobank"],
+      "evidence_output_ids": [],
+      "confidence": 0.8
+    },
+    {
+      "theme_id": "xin-imaging",
+      "theme_name": "AI medical imaging for oral cancer and abdominal MRI",
+      "summary": "Deep learning classification and segmentation for oral cancer, oral potentially malignant disorders and quantitative abdominal MRI using convolutional networks, vision transformers, U-Net, Mask R-CNN and SAM.",
+      "keywords": ["medical imaging", "segmentation", "oral cancer", "MRI", "deep learning", "vision transformer"],
+      "methods": ["deep learning", "imaging", "segmentation"],
+      "diseases": ["oral cancer"],
+      "populations": ["patients"],
+      "data_types": ["imaging", "MRI"],
+      "evidence_output_ids": [],
+      "confidence": 0.8
+    }
+  ]
+}
