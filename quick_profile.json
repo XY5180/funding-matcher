@@ -26,9 +26,9 @@
   "themes": [
     {
       "theme_id": "xin-ehr-ai",
-      "theme_name": "Interpretable AI for longitudinal electronic health records",
+      "theme_name": "Interpretable embeddings for longitudinal EHR",
       "summary": "Machine learning, large language model embeddings and interpretable representation learning for longitudinal EHR, phecodes, clinical trajectories and cancer risk prediction.",
-      "keywords": ["electronic health records", "EHR", "machine learning", "artificial intelligence", "embeddings", "cancer risk", "clinical data"],
+      "keywords": ["electronic health records", "EHR", "machine learning", "artificial intelligence", "embeddings", "LLM", "clinical data"],
       "methods": ["machine learning", "artificial intelligence", "natural language processing"],
       "diseases": ["cancer"],
       "populations": ["patients"],
@@ -50,9 +50,9 @@
     },
     {
       "theme_id": "xin-imaging",
-      "theme_name": "AI medical imaging for oral cancer and abdominal MRI",
+      "theme_name": "AI medical imaging for abdominal MRI",
       "summary": "Deep learning classification and segmentation for oral cancer, oral potentially malignant disorders and quantitative abdominal MRI using convolutional networks, vision transformers, U-Net, Mask R-CNN and SAM.",
-      "keywords": ["medical imaging", "segmentation", "oral cancer", "MRI", "deep learning", "vision transformer"],
+      "keywords": ["medical imaging", "segmentation", "MRI", "deep learning"],
       "methods": ["deep learning", "imaging", "segmentation"],
       "diseases": ["oral cancer"],
       "populations": ["patients"],
