@@ -13,7 +13,7 @@ import streamlit as st
 from funding_match.clients import ScopusClient, utcnow
 from funding_match.db import connect, upsert
 from funding_match.pipeline import (build_profiles, import_scopus_researcher,
-                                    match_all, sync_grants, terms)
+                                    match_all, sync_grants)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -37,8 +37,50 @@ def request_config(scopus_api_key="", simpler_grants_api_key=""):
     return config
 
 
+def extract_indexed_keywords(payload):
+    """Extract Scopus indexed terms (including MeSH) from common JSON shapes."""
+    root = payload.get("abstracts-retrieval-response", payload)
+    containers = []
+
+    def find_containers(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = key.lower().replace("_", "-")
+                if normalized in {
+                    "idxterms", "idxterm", "indexed-keywords", "mesh",
+                    "mesh-headings", "authkeywords", "author-keyword",
+                }:
+                    containers.append(child)
+                find_containers(child)
+        elif isinstance(value, list):
+            for child in value:
+                find_containers(child)
+
+    def scalar_terms(value):
+        found = []
+        if isinstance(value, str):
+            found.extend(part.strip() for part in value.split(";") if part.strip())
+        elif isinstance(value, list):
+            for child in value:
+                found.extend(scalar_terms(child))
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                if not key.startswith("@") and key not in {"$ref", "href"}:
+                    found.extend(scalar_terms(child))
+        return found
+
+    find_containers(root)
+    cleaned = []
+    for container in containers:
+        for term in scalar_terms(container):
+            term = " ".join(term.split())
+            if 2 < len(term) <= 100 and not term.startswith("http"):
+                cleaned.append(term)
+    return list(dict.fromkeys(cleaned))
+
+
 def generate_scopus_keywords(profile, max_publications, scopus_api_key=""):
-    """Generate 12 candidates quickly from recent Scopus publication titles."""
+    """Generate 12 candidates from Scopus Indexed Keywords/MeSH metadata."""
     config = request_config(scopus_api_key=scopus_api_key)
     client = ScopusClient(config, api_key=scopus_api_key)
     author_id = (profile.get("scopus_author_id") or "").strip()
@@ -56,22 +98,29 @@ def generate_scopus_keywords(profile, max_publications, scopus_api_key=""):
 
     scores = Counter()
     publication_count = 0
-    ignored = {
-        "analysis", "approach", "associated", "based", "data", "effect",
-        "evidence", "method", "methods", "model", "models", "patient",
-        "patients", "results", "risk", "role", "study", "system", "use",
+    generic_index_terms = {
+        "adult", "aged", "article", "female", "human", "humans", "male",
+        "middle aged", "priority journal", "review", "controlled study",
     }
     for entry in client.publications(author_id):
         if publication_count >= max_publications:
             break
-        title_terms = terms(entry.get("dc:title") or "")
-        for term in title_terms:
-            if term not in ignored:
+        eid = entry.get("eid") or ""
+        indexed = []
+        if eid:
+            try:
+                indexed = extract_indexed_keywords(client.abstract(eid))
+            except RuntimeError:
+                indexed = []
+        for term in indexed:
+            if term.casefold() not in generic_index_terms:
                 scores[term] += 1
         publication_count += 1
     keywords = [term for term, _ in scores.most_common(12)]
     if not keywords:
-        raise ValueError("No usable keywords were found in the imported publication titles")
+        raise ValueError(
+            "No Indexed Keywords/MeSH terms were available through the current "
+            "Scopus API entitlement. Use manual keyword mode instead.")
     return keywords, publication_count, author_id
 
 
@@ -386,12 +435,12 @@ candidate_keywords = keyword_cache.get("keywords", [])
 keyword_revision = st.session_state.get(f"keyword_revision_{mode_key}", 0)
 
 profile_defaults = {
-    "name": "Xin Yuan" if use_default_profile else "",
-    "title": "Postdoctoral Researcher" if use_default_profile else "",
+    "name": "Dajiang Liu" if use_default_profile else "",
+    "title": "",
     "organization": "Penn State College of Medicine" if use_default_profile else "",
     "email": "",
     "orcid": "",
-    "country": "US" if use_default_profile else "",
+    "country": "United States" if use_default_profile else "",
     "scopus_author_id": "55848832700" if use_default_profile else "",
 }
 
@@ -410,14 +459,16 @@ with st.form(f"researcher-form-{mode_key}"):
         career_stage = st.selectbox(
             "Career stage",
             ["", "postdoc", "faculty", "student", "staff scientist", "other"],
-            index=1 if use_default_profile else 0,
+            index=2 if use_default_profile else 0,
             key=f"profile-career-{mode_key}",
         )
         country = st.text_input("Country", profile_defaults["country"], key=f"profile-country-{mode_key}")
         pi_answer = st.selectbox(
-            "Independent PI?", ["", "No", "Yes"], key=f"profile-pi-{mode_key}")
+            "Independent PI?", ["", "No", "Yes"],
+            index=2 if use_default_profile else 0, key=f"profile-pi-{mode_key}")
         animal_answer = st.selectbox(
-            "Works with animal models?", ["", "No", "Yes"], key=f"profile-animal-{mode_key}")
+            "Works with animal models?", ["", "No", "Yes"],
+            index=1 if use_default_profile else 0, key=f"profile-animal-{mode_key}")
         scopus_author_id = st.text_input(
             "Scopus Author ID (optional)", profile_defaults["scopus_author_id"],
             key=f"profile-scopus-{mode_key}")
@@ -435,9 +486,16 @@ with st.form(f"researcher-form-{mode_key}"):
     if not scopus_ready:
         st.caption("Enter a Scopus API key above to enable publication import.")
 
-    st.subheader("2. Generate and select research keywords")
-    if candidate_keywords:
-        st.write("**12 keywords generated from the selected Scopus publications:**")
+    st.subheader("2. Select keyword source and theme scope")
+    keyword_mode = st.radio(
+        "Keyword source",
+        ["Import Indexed Keywords/MeSH from Scopus", "Enter keywords manually"],
+        horizontal=True,
+        key=f"keyword-mode-{mode_key}",
+    )
+    automatic_keyword_mode = keyword_mode.startswith("Import")
+    if automatic_keyword_mode and candidate_keywords:
+        st.write("**12 indexed keywords generated from the selected Scopus publications:**")
         st.write(" · ".join(candidate_keywords))
         st.caption(
             "Select a distinct keyword group for each theme. A paper will be "
@@ -454,12 +512,28 @@ with st.form(f"researcher-form-{mode_key}"):
                     default=default_group,
                     key=f"seed-scope-{mode_key}-{keyword_revision}-{seed_index}",
                 ))
-    else:
+    elif automatic_keyword_mode:
         seed_keywords = [[], [], []]
         st.info(
             "Complete the researcher profile, choose the publication count, "
-            "then click Generate 12 keywords."
+            "then click Import 12 indexed keywords."
         )
+    else:
+        st.caption(
+            "Enter comma-separated keywords freely. These groups define the "
+            "scope used to assign papers and generate the three themes."
+        )
+        manual_columns = st.columns(3)
+        seed_keywords = []
+        for seed_index, column in enumerate(manual_columns, start=1):
+            with column:
+                manual_value = st.text_area(
+                    f"Theme {seed_index} keywords",
+                    key=f"manual-keywords-{mode_key}-{seed_index}",
+                    placeholder="keyword 1, keyword 2, keyword 3",
+                    height=100,
+                )
+                seed_keywords.append(split_terms(manual_value))
 
     include_manual_themes = st.checkbox(
         "Also include the manually entered themes below",
@@ -478,29 +552,6 @@ with st.form(f"researcher-form-{mode_key}"):
         )
     else:
         st.caption("The first theme is required. Leave theme 2 or 3 blank if not needed.")
-    example_theme_defaults = [
-        (
-            "Interpretable AI for longitudinal electronic health records",
-            "Machine learning, language-model embeddings and interpretable representation learning for longitudinal EHR, phecodes, clinical trajectories and cancer risk prediction.",
-            "EHR, electronic health records, machine learning, embeddings, cancer risk",
-            "machine learning, artificial intelligence, natural language processing",
-            "cancer", "patients", "EHR, clinical data",
-        ),
-        (
-            "Statistical genetics and multi-omics",
-            "GWAS, statistical genetics, causal inference and integration of multi-omics with phenotypes in population biobanks.",
-            "GWAS, statistical genetics, functional genomics, multi-omics, biobank",
-            "statistical genetics, causal inference, bioinformatics",
-            "complex disease", "population biobank", "genomics, multi-omics, biobank",
-        ),
-        (
-            "AI medical imaging for oral cancer and abdominal MRI",
-            "Deep-learning classification and segmentation for oral cancer, potentially malignant disorders and quantitative abdominal MRI.",
-            "medical imaging, segmentation, oral cancer, MRI, deep learning",
-            "deep learning, imaging, segmentation",
-            "oral cancer", "patients", "imaging, MRI",
-        ),
-    ]
     blank_theme = ("", "", "", "", "", "", "")
     generated_defaults = [(
         theme.get("name", ""),
@@ -512,8 +563,7 @@ with st.form(f"researcher-form-{mode_key}"):
         ", ".join(theme.get("data_types", [])),
     ) for theme in generated_theme_cache[:3]]
     generated_defaults += [blank_theme] * (3 - len(generated_defaults))
-    defaults = (example_theme_defaults if use_default_profile
-                else generated_defaults)
+    defaults = generated_defaults
     entered_themes = []
     for index, values in enumerate(defaults, start=1):
         with st.expander(f"Theme {index}", expanded=index == 1):
@@ -575,7 +625,8 @@ with st.form(f"researcher-form-{mode_key}"):
     action_col1, action_col2 = st.columns(2)
     with action_col1:
         generate_keywords_clicked = st.form_submit_button(
-            "1. Generate 12 keywords", use_container_width=True)
+            "1. Import 12 indexed keywords", use_container_width=True,
+            disabled=not automatic_keyword_mode)
     with action_col2:
         submitted = st.form_submit_button(
             "2. Generate themes and find funding", type="primary",
@@ -591,7 +642,7 @@ profile = {
 }
 profile_signature = json.dumps({
     "orcid": profile["orcid"], "scopus_author_id": profile["scopus_author_id"],
-    "max_publications": max_publications,
+    "max_publications": max_publications, "keyword_mode": keyword_mode,
 }, sort_keys=True)
 
 if generate_keywords_clicked:
@@ -604,7 +655,7 @@ if generate_keywords_clicked:
         st.error("Enter an ORCID or Scopus Author ID first.")
     else:
         try:
-            with st.spinner("Importing publication titles and generating 12 keywords..."):
+            with st.spinner("Importing Scopus Indexed Keywords/MeSH metadata..."):
                 keywords, keyword_paper_count, keyword_author_id = generate_scopus_keywords(
                     profile, max_publications, scopus_api_key)
             updated = dict(st.session_state.get("keyword_candidates", {}))
@@ -632,9 +683,10 @@ if submitted:
                         else [])
     if not name.strip():
         st.error("Name is required.")
-    elif use_scopus and not candidate_keywords:
-        st.error("Generate the 12 Scopus keywords before creating themes.")
-    elif use_scopus and keyword_cache.get("signature") != profile_signature:
+    elif use_scopus and automatic_keyword_mode and not candidate_keywords:
+        st.error("Import the 12 Scopus indexed keywords before creating themes.")
+    elif (use_scopus and automatic_keyword_mode
+          and keyword_cache.get("signature") != profile_signature):
         st.error("The profile or publication count changed. Generate the 12 keywords again.")
     elif use_scopus and any(not group for group in seed_keywords):
         st.error("Select at least one keyword for each of the three themes.")
