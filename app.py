@@ -40,7 +40,7 @@ def request_config(scopus_api_key="", simpler_grants_api_key=""):
 def generate_scopus_keywords(profile, max_publications, scopus_api_key=""):
     """Generate 12 candidates quickly from recent Scopus publication titles."""
     config = request_config(scopus_api_key=scopus_api_key)
-    client = ScopusClient(config)
+    client = ScopusClient(config, api_key=scopus_api_key)
     author_id = (profile.get("scopus_author_id") or "").strip()
     if not author_id:
         orcid = (profile.get("orcid") or "").strip()
@@ -131,7 +131,7 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
         if use_scopus:
             imported_publications, resolved_author_id = import_scopus_researcher(
                 conn, run_config, "web-form-researcher",
-                max_publications=max_publications)
+                max_publications=max_publications, api_key=scopus_api_key)
             build_profiles(
                 conn, max_themes=3, seed_keywords=seed_keywords,
                 researcher_id="web-form-researcher")
@@ -147,7 +147,9 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
 
         if use_live_grants:
             try:
-                opportunity_count = sync_grants(conn, run_config, funding_query)
+                opportunity_count = sync_grants(
+                    conn, run_config, funding_query,
+                    api_key=simpler_grants_api_key)
                 if not opportunity_count:
                     raise ValueError(
                         "Simpler.Grants.gov returned no opportunities for this query")

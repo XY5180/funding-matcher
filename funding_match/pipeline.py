@@ -231,14 +231,15 @@ def sync_scopus(conn, config):
     conn.commit()
     return written
 
-def import_scopus_researcher(conn, config, researcher_id, max_publications=20):
+def import_scopus_researcher(conn, config, researcher_id, max_publications=20,
+                             api_key=""):
     """Enrich one manually entered researcher without requiring Pure."""
     researcher = conn.execute(
         "SELECT * FROM researchers WHERE researcher_id=?", (researcher_id,)
     ).fetchone()
     if not researcher:
         raise ValueError(f"Unknown researcher: {researcher_id}")
-    client = ScopusClient(config)
+    client = ScopusClient(config, api_key=api_key)
     author_id = (researcher["scopus_author_id"] or "").strip()
     if not author_id:
         orcid = (researcher["orcid"] or "").strip()
@@ -297,9 +298,9 @@ def import_scopus_researcher(conn, config, researcher_id, max_publications=20):
     conn.commit()
     return written, author_id
 
-def sync_grants(conn, config, query=""):
+def sync_grants(conn, config, query="", api_key=""):
     n = 0
-    for raw in SimplerGrantsClient(config).opportunities(query):
+    for raw in SimplerGrantsClient(config, api_key=api_key).opportunities(query):
         row = normalize_grant(raw)
         if row["opportunity_id"]:
             upsert(conn, "opportunities", row, ["opportunity_id"]); n += 1

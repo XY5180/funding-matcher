@@ -46,7 +46,10 @@ def request_json(url, headers=None, body=None, retries=3):
                 raise RuntimeError(f"Cannot reach {url}: {exc}") from exc
         time.sleep(2 ** attempt)
 
-def need_key(config, section):
+def need_key(config, section, explicit_value=""):
+    explicit_value = str(explicit_value or "").strip()
+    if explicit_value:
+        return explicit_value
     direct_value = str(config[section].get("api_key", "")).strip()
     if direct_value:
         return direct_value
@@ -96,9 +99,9 @@ class PureClient:
             offset += len(rows)
 
 class ScopusClient:
-    def __init__(self, config):
+    def __init__(self, config, api_key=""):
         self.cfg = config["scopus"]
-        self.key = need_key(config, "scopus")
+        self.key = need_key(config, "scopus", api_key)
         self.headers = {"X-ELS-APIKey": self.key, "Accept": "application/json"}
         token = os.environ.get(self.cfg.get("institution_token_env", ""), "").strip()
         if token:
@@ -140,9 +143,9 @@ class ScopusClient:
                             self.headers)
 
 class SimplerGrantsClient:
-    def __init__(self, config):
+    def __init__(self, config, api_key=""):
         self.cfg = config["simpler_grants"]
-        self.key = need_key(config, "simpler_grants")
+        self.key = need_key(config, "simpler_grants", api_key)
         self.headers = {"X-API-Key": self.key, "Content-Type": "application/json"}
 
     def opportunities(self, query=""):
