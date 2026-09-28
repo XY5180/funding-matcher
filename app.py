@@ -4,14 +4,16 @@
 import json
 import os
 import tempfile
+from collections import Counter
+from copy import deepcopy
 from pathlib import Path
 
 import streamlit as st
 
-from funding_match.clients import utcnow
+from funding_match.clients import ScopusClient, utcnow
 from funding_match.db import connect, upsert
 from funding_match.pipeline import (build_profiles, import_scopus_researcher,
-                                    match_all, sync_grants)
+                                    match_all, sync_grants, terms)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -25,10 +27,60 @@ def split_terms(value):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def request_config(scopus_api_key="", simpler_grants_api_key=""):
+    """Build a per-request config without changing process-wide environment variables."""
+    config = deepcopy(CONFIG)
+    if scopus_api_key.strip():
+        config["scopus"]["api_key"] = scopus_api_key.strip()
+    if simpler_grants_api_key.strip():
+        config["simpler_grants"]["api_key"] = simpler_grants_api_key.strip()
+    return config
+
+
+def generate_scopus_keywords(profile, max_publications, scopus_api_key=""):
+    """Generate 12 candidates quickly from recent Scopus publication titles."""
+    config = request_config(scopus_api_key=scopus_api_key)
+    client = ScopusClient(config)
+    author_id = (profile.get("scopus_author_id") or "").strip()
+    if not author_id:
+        orcid = (profile.get("orcid") or "").strip()
+        if not orcid:
+            raise ValueError("Enter an ORCID or Scopus Author ID first")
+        entries = client.author_search(
+            f"ORCID({orcid})").get("search-results", {}).get("entry", [])
+        if len(entries) != 1:
+            raise ValueError(
+                f"Scopus returned {len(entries)} authors for ORCID {orcid}; "
+                "enter the Scopus Author ID to select the correct researcher")
+        author_id = entries[0].get("dc:identifier", "").replace("AUTHOR_ID:", "")
+
+    scores = Counter()
+    publication_count = 0
+    ignored = {
+        "analysis", "approach", "associated", "based", "data", "effect",
+        "evidence", "method", "methods", "model", "models", "patient",
+        "patients", "results", "risk", "role", "study", "system", "use",
+    }
+    for entry in client.publications(author_id):
+        if publication_count >= max_publications:
+            break
+        title_terms = terms(entry.get("dc:title") or "")
+        for term in title_terms:
+            if term not in ignored:
+                scores[term] += 1
+        publication_count += 1
+    keywords = [term for term, _ in scores.most_common(12)]
+    if not keywords:
+        raise ValueError("No usable keywords were found in the imported publication titles")
+    return keywords, publication_count, author_id
+
+
 def run_match(profile, themes, use_scopus=False, max_publications=20,
-              use_live_grants=False, funding_query="", seed_keywords=None):
+              use_live_grants=False, funding_query="", seed_keywords=None,
+              scopus_api_key="", simpler_grants_api_key=""):
     """Run one isolated match without changing the command-line database."""
     with tempfile.TemporaryDirectory(prefix="funding-match-") as tmp:
+        run_config = request_config(scopus_api_key, simpler_grants_api_key)
         conn = connect(Path(tmp) / "web-demo.db")
         organization = {
             "organization_id": "web-form-org",
@@ -78,7 +130,8 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
         resolved_author_id = profile["scopus_author_id"]
         if use_scopus:
             imported_publications, resolved_author_id = import_scopus_researcher(
-                conn, CONFIG, "web-form-researcher", max_publications=max_publications)
+                conn, run_config, "web-form-researcher",
+                max_publications=max_publications)
             build_profiles(
                 conn, max_themes=3, seed_keywords=seed_keywords,
                 researcher_id="web-form-researcher")
@@ -94,7 +147,7 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
 
         if use_live_grants:
             try:
-                opportunity_count = sync_grants(conn, CONFIG, funding_query)
+                opportunity_count = sync_grants(conn, run_config, funding_query)
                 if not opportunity_count:
                     raise ValueError(
                         "Simpler.Grants.gov returned no opportunities for this query")
@@ -294,6 +347,24 @@ if st.button("Start a new search", help="Clear the previous profile, themes, and
     st.session_state["profile-mode"] = "New researcher"
     st.rerun()
 
+with st.expander("API access", expanded=True):
+    st.caption(
+        "Keys entered here are used only for this browser session and are not "
+        "saved to the repository or database. Leave blank to use server Secrets."
+    )
+    api_col1, api_col2 = st.columns(2)
+    with api_col1:
+        scopus_key_input = st.text_input(
+            "Scopus API key", type="password", key="session-scopus-key")
+    with api_col2:
+        grants_key_input = st.text_input(
+            "Simpler.Grants.gov API key", type="password", key="session-grants-key")
+
+scopus_api_key = (scopus_key_input.strip()
+                  or os.environ.get("SCOPUS_API_KEY", "").strip())
+simpler_grants_api_key = (grants_key_input.strip()
+                          or os.environ.get("SIMPLER_GRANTS_API_KEY", "").strip())
+
 profile_mode = st.radio(
     "Profile mode",
     ["Default example profile", "New researcher"],
@@ -307,6 +378,10 @@ mode_key = "default" if use_default_profile else "new"
 generated_theme_store = st.session_state.get("generated_themes", {})
 generated_theme_cache = generated_theme_store.get(mode_key, [])
 theme_revision = st.session_state.get(f"theme_revision_{mode_key}", 0)
+keyword_store = st.session_state.get("keyword_candidates", {})
+keyword_cache = keyword_store.get(mode_key, {})
+candidate_keywords = keyword_cache.get("keywords", [])
+keyword_revision = st.session_state.get(f"keyword_revision_{mode_key}", 0)
 
 profile_defaults = {
     "name": "Xin Yuan" if use_default_profile else "",
@@ -345,40 +420,44 @@ with st.form(f"researcher-form-{mode_key}"):
             "Scopus Author ID (optional)", profile_defaults["scopus_author_id"],
             key=f"profile-scopus-{mode_key}")
 
-    scopus_ready = bool(os.environ.get("SCOPUS_API_KEY", "").strip())
+    scopus_ready = bool(scopus_api_key)
     use_scopus = st.checkbox(
         "Import publications from Scopus",
         value=scopus_ready,
         disabled=not scopus_ready,
         key=f"use-scopus-{mode_key}",
-        help=("Uses SCOPUS_API_KEY from the server environment."
+        help=("Uses the session key entered above or SCOPUS_API_KEY from server Secrets."
               if scopus_ready else
-              "Set SCOPUS_API_KEY locally or in Streamlit Secrets to enable this option."),
+              "Enter a Scopus API key above or configure Streamlit Secrets."),
     )
     if not scopus_ready:
-        st.caption("Scopus enrichment is currently off because SCOPUS_API_KEY is not configured.")
+        st.caption("Enter a Scopus API key above to enable publication import.")
 
-    st.subheader("2. Theme seed keywords")
-    st.caption(
-        "Enter several keywords for each theme. Imported Scopus papers are "
-        "assigned to the single best-matching theme before that theme is generated."
-    )
-    default_seed_values = [
-        "electronic health records, language model embeddings, cancer risk",
-        "GWAS, statistical genetics, multi-omics, biobank",
-        "medical imaging, oral cancer, MRI, segmentation",
-    ] if use_default_profile else ["", "", ""]
-    seed_columns = st.columns(3)
-    theme_seed_inputs = []
-    for seed_index, column in enumerate(seed_columns, start=1):
-        with column:
-            theme_seed_inputs.append(st.text_area(
-                f"Theme {seed_index} keywords",
-                default_seed_values[seed_index - 1],
-                key=f"seed-keywords-{mode_key}-{seed_index}",
-                placeholder="keyword 1, keyword 2, keyword 3",
-                height=100,
-            ))
+    st.subheader("2. Generate and select research keywords")
+    if candidate_keywords:
+        st.write("**12 keywords generated from the selected Scopus publications:**")
+        st.write(" · ".join(candidate_keywords))
+        st.caption(
+            "Select a distinct keyword group for each theme. A paper will be "
+            "assigned only to its strongest matching theme."
+        )
+        seed_columns = st.columns(3)
+        seed_keywords = []
+        for seed_index, column in enumerate(seed_columns, start=1):
+            with column:
+                default_group = candidate_keywords[seed_index - 1::3]
+                seed_keywords.append(st.multiselect(
+                    f"Theme {seed_index} keyword scope",
+                    options=candidate_keywords,
+                    default=default_group,
+                    key=f"seed-scope-{mode_key}-{keyword_revision}-{seed_index}",
+                ))
+    else:
+        seed_keywords = [[], [], []]
+        st.info(
+            "Complete the researcher profile, choose the publication count, "
+            "then click Generate 12 keywords."
+        )
 
     include_manual_themes = st.checkbox(
         "Also include the manually entered themes below",
@@ -477,13 +556,13 @@ with st.form(f"researcher-form-{mode_key}"):
         minimum_fit = st.selectbox("Minimum scientific fit", [0, 10, 20, 30, 40], index=0)
     max_publications = st.selectbox("Maximum Scopus publications to import", [10, 20, 50], index=1,
                                     disabled=not use_scopus)
-    grants_ready = bool(os.environ.get("SIMPLER_GRANTS_API_KEY", "").strip())
+    grants_ready = bool(simpler_grants_api_key)
     use_live_grants = st.checkbox(
         "Search live opportunities from Simpler.Grants.gov",
         value=False, disabled=not grants_ready,
-        help=("Uses SIMPLER_GRANTS_API_KEY from the server environment."
+        help=("Uses the session key entered above or SIMPLER_GRANTS_API_KEY from server Secrets."
               if grants_ready else
-              "Set SIMPLER_GRANTS_API_KEY to enable live funding search."),
+              "Enter a Simpler.Grants.gov API key above or configure Streamlit Secrets."),
     )
     funding_query = st.text_input(
         "Funding search terms",
@@ -491,30 +570,78 @@ with st.form(f"researcher-form-{mode_key}"):
         disabled=not use_live_grants,
     )
 
-    submitted = st.form_submit_button("Find funding opportunities", type="primary")
+    action_col1, action_col2 = st.columns(2)
+    with action_col1:
+        generate_keywords_clicked = st.form_submit_button(
+            "1. Generate 12 keywords", use_container_width=True)
+    with action_col2:
+        submitted = st.form_submit_button(
+            "2. Generate themes and find funding", type="primary",
+            use_container_width=True)
+
+tri_state = {"": None, "No": 0, "Yes": 1}
+profile = {
+    "name": name.strip(), "email": email.strip(), "title": title.strip(),
+    "organization": organization.strip(), "career_stage": career_stage,
+    "country": country.strip(), "independent_pi": tri_state[pi_answer],
+    "works_with_animals": tri_state[animal_answer],
+    "orcid": orcid.strip(), "scopus_author_id": scopus_author_id.strip(),
+}
+profile_signature = json.dumps({
+    "orcid": profile["orcid"], "scopus_author_id": profile["scopus_author_id"],
+    "max_publications": max_publications,
+}, sort_keys=True)
+
+if generate_keywords_clicked:
+    st.session_state.pop("match_results", None)
+    if not profile["name"]:
+        st.error("Name is required.")
+    elif not scopus_api_key:
+        st.error("Enter a Scopus API key in API access first.")
+    elif not profile["orcid"] and not profile["scopus_author_id"]:
+        st.error("Enter an ORCID or Scopus Author ID first.")
+    else:
+        try:
+            with st.spinner("Importing publication titles and generating 12 keywords..."):
+                keywords, keyword_paper_count, keyword_author_id = generate_scopus_keywords(
+                    profile, max_publications, scopus_api_key)
+            updated = dict(st.session_state.get("keyword_candidates", {}))
+            updated[mode_key] = {
+                "keywords": keywords,
+                "signature": profile_signature,
+                "publication_count": keyword_paper_count,
+                "author_id": keyword_author_id,
+            }
+            st.session_state["keyword_candidates"] = updated
+            st.session_state[f"keyword_revision_{mode_key}"] = keyword_revision + 1
+            st.rerun()
+        except Exception as exc:
+            message = str(exc)
+            if "APIKEY_INVALID" in message or "HTTP 401" in message:
+                st.error("Scopus rejected the API key entered above.")
+            else:
+                st.exception(exc)
 
 if submitted:
     # Do not leave an earlier result visible when a new submission is invalid.
     st.session_state.pop("match_results", None)
     valid_themes = [theme for theme in entered_themes if theme["name"] and theme["summary"]]
-    seed_keywords = [split_terms(value) for value in theme_seed_inputs]
     themes_for_match = (valid_themes if (not use_scopus or include_manual_themes)
                         else [])
     if not name.strip():
         st.error("Name is required.")
+    elif use_scopus and not candidate_keywords:
+        st.error("Generate the 12 Scopus keywords before creating themes.")
+    elif use_scopus and keyword_cache.get("signature") != profile_signature:
+        st.error("The profile or publication count changed. Generate the 12 keywords again.")
     elif use_scopus and any(not group for group in seed_keywords):
-        st.error("Enter at least one seed keyword for each of the three themes.")
+        st.error("Select at least one keyword for each of the three themes.")
+    elif use_scopus and len([item for group in seed_keywords for item in group]) != len({
+            item for group in seed_keywords for item in group}):
+        st.error("Assign each keyword to only one theme scope to avoid overlapping evidence.")
     elif not use_scopus and not valid_themes:
         st.error("Enter at least one research theme with a name and summary.")
     else:
-        tri_state = {"": None, "No": 0, "Yes": 1}
-        profile = {
-            "name": name.strip(), "email": email.strip(), "title": title.strip(),
-            "organization": organization.strip(), "career_stage": career_stage,
-            "country": country.strip(), "independent_pi": tri_state[pi_answer],
-            "works_with_animals": tri_state[animal_answer],
-            "orcid": orcid.strip(), "scopus_author_id": scopus_author_id.strip(),
-        }
         try:
             with st.spinner(
                 "Importing Scopus papers, generating themes, and matching funding..."
@@ -526,7 +653,9 @@ if submitted:
                     max_publications=max_publications,
                     use_live_grants=use_live_grants,
                     funding_query=funding_query.strip(),
-                    seed_keywords=seed_keywords if use_scopus else None)
+                    seed_keywords=seed_keywords if use_scopus else None,
+                    scopus_api_key=scopus_api_key,
+                    simpler_grants_api_key=simpler_grants_api_key)
             st.session_state["match_results"] = (
                 opportunity_rows, theme_rows, snapshot_date, top_k, minimum_fit,
                 imported_count, resolved_author_id, opportunity_count,

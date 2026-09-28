@@ -15,12 +15,12 @@ from environment variables and are never written to the database.
 ## Quick start
 
 ```bash
+cd funding_match_system
 python run_pipeline.py demo --reset
 ```
 
 This creates:
 
-- `data/funding_match.db`
 - `output/demo_matches.csv`
 
 ## Key-free preview using Xin Yuan's profile
@@ -55,6 +55,81 @@ separately from eligibility review, links to each official announcement, and
 downloads the results as CSV. It provides both a theme-centric Top-K view and
 an opportunity-centric best-theme view. It uses the same `funding_match/` backend as
 `run_pipeline.py`; neither entry point replaces the other.
+
+### Public version without Pure
+
+Pure is optional. The web app can use manually entered profile fields plus
+Scopus publications and the funding source. Configure Scopus locally with:
+
+```bash
+export SCOPUS_API_KEY="..."
+python -m streamlit run app.py
+```
+
+Then enter either an ORCID or a Scopus Author ID and select **Import
+publications from Scopus**. For Streamlit Community Cloud, add
+`SCOPUS_API_KEY="..."` under App settings → Secrets. Do not commit the key to
+GitHub. Without the key, the same page continues to work with manually entered
+research themes.
+
+Scopus Search is requested in pages of 25 so the import also works with the
+basic developer service level. Choosing 50 publications uses multiple pages.
+When Scopus import is selected, the web app defaults to matching only with
+themes generated from the imported publications. Select **Also include the
+manually entered themes below** only when both sources should be combined.
+
+The web form has two profile modes. **Default example profile** fills the
+existing demonstration researcher details, including its Scopus Author ID.
+**New researcher** starts with blank profile and theme fields. In either mode,
+an ORCID or Scopus Author ID can be used to import publications and generate
+themes automatically.
+
+After a new researcher is matched, the three generated themes are written back
+into the Theme 1–3 fields for review. Each generated theme also lists the
+Scopus publication title(s) recorded as evidence for that theme.
+
+The web workflow first imports the requested number of recent Scopus
+publication titles and generates 12 candidate keywords. The researcher then
+selects a non-overlapping keyword scope for each of three themes. Each imported
+paper is assigned to only its strongest matching keyword group, so the
+evidence-paper lists do not overlap across themes. The **Start a new search**
+button clears the previous profile, keywords, generated themes, and results,
+then opens a blank new-researcher form.
+
+For a public Streamlit deployment, API keys can be supplied either through
+Streamlit Secrets or temporarily through the password fields under **API
+access**. Session-entered keys are passed in a per-request configuration and
+are not written to `.env`, the database, or the repository.
+
+If `SIMPLER_GRANTS_API_KEY` is also configured, the page can search live
+opportunities from Simpler.Grants.gov. Otherwise it uses the included dated
+funding snapshot. Neither path requires Pure.
+
+If the Simpler.Grants.gov key is invalid or the live service is temporarily
+unavailable, the web app displays a warning and automatically falls back to
+the included snapshot instead of stopping the whole match.
+
+### Save API keys locally
+
+The simplest safe setup is:
+
+```bash
+python setup_keys.py
+python -m streamlit run app.py
+```
+
+`setup_keys.py` hides keyboard input, saves both keys in a local `.env` file,
+and restricts the file permissions. The application loads `.env`
+automatically. `.gitignore` excludes `.env`, so it must never be uploaded to
+GitHub. Alternatively, copy `.env.example` to `.env` and edit the two values.
+
+For Streamlit Community Cloud, do not upload `.env`. Add the same names under
+App settings → Secrets:
+
+```toml
+SCOPUS_API_KEY = "..."
+SIMPLER_GRANTS_API_KEY = "..."
+```
 
 The command-line version can export the Top 5 opportunities for every theme:
 

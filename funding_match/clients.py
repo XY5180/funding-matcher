@@ -47,6 +47,9 @@ def request_json(url, headers=None, body=None, retries=3):
         time.sleep(2 ** attempt)
 
 def need_key(config, section):
+    direct_value = str(config[section].get("api_key", "")).strip()
+    if direct_value:
+        return direct_value
     env_name = config[section]["api_key_env"]
     value = os.environ.get(env_name, "").strip()
     if not value:
