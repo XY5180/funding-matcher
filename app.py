@@ -45,10 +45,13 @@ def extract_indexed_keywords(payload):
     def find_containers(value):
         if isinstance(value, dict):
             for key, child in value.items():
-                normalized = key.lower().replace("_", "-")
+                # Elsevier sometimes prefixes JSON fields with a namespace,
+                # for example ``ce:indexed-keywords``.
+                normalized = key.lower().replace("_", "-").split(":")[-1]
                 if normalized in {
                     "idxterms", "idxterm", "indexed-keywords", "mesh",
-                    "mesh-headings", "authkeywords", "author-keyword",
+                    "mesh-heading", "mesh-headings", "authkeywords",
+                    "author-keyword", "author-keywords",
                 }:
                     containers.append(child)
                 find_containers(child)
@@ -444,7 +447,9 @@ profile_defaults = {
     "scopus_author_id": "55848832700" if use_default_profile else "",
 }
 
-with st.form(f"researcher-form-{mode_key}"):
+# Use a normal container rather than st.form so changing the keyword source
+# immediately reruns the page and reveals the correct controls.
+with st.container(border=True):
     st.subheader("1. Researcher profile")
     col1, col2 = st.columns(2)
     with col1:
@@ -494,6 +499,7 @@ with st.form(f"researcher-form-{mode_key}"):
         key=f"keyword-mode-{mode_key}",
     )
     automatic_keyword_mode = keyword_mode.startswith("Import")
+
     if automatic_keyword_mode and candidate_keywords:
         st.write("**12 indexed keywords generated from the selected Scopus publications:**")
         st.write(" · ".join(candidate_keywords))
@@ -622,14 +628,19 @@ with st.form(f"researcher-form-{mode_key}"):
         disabled=not use_live_grants,
     )
 
-    action_col1, action_col2 = st.columns(2)
-    with action_col1:
-        generate_keywords_clicked = st.form_submit_button(
-            "1. Import 12 indexed keywords", use_container_width=True,
-            disabled=not automatic_keyword_mode)
-    with action_col2:
-        submitted = st.form_submit_button(
-            "2. Generate themes and find funding", type="primary",
+    if automatic_keyword_mode:
+        action_col1, action_col2 = st.columns(2)
+        with action_col1:
+            generate_keywords_clicked = st.button(
+                "1. Import 12 indexed keywords", use_container_width=True)
+        with action_col2:
+            submitted = st.button(
+                "2. Generate themes and find funding", type="primary",
+                use_container_width=True)
+    else:
+        generate_keywords_clicked = False
+        submitted = st.button(
+            "Generate themes and find funding", type="primary",
             use_container_width=True)
 
 tri_state = {"": None, "No": 0, "Yes": 1}
@@ -672,8 +683,15 @@ if generate_keywords_clicked:
             message = str(exc)
             if "APIKEY_INVALID" in message or "HTTP 401" in message:
                 st.error("Scopus rejected the API key entered above.")
+            elif "No Indexed Keywords/MeSH terms" in message:
+                st.warning(
+                    "Scopus returned the publications, but this API key did not "
+                    "provide Indexed Keywords/MeSH metadata. Select ‘Enter "
+                    "keywords manually’ above; the three keyword boxes will "
+                    "appear immediately."
+                )
             else:
-                st.exception(exc)
+                st.error(f"Scopus keyword import could not be completed: {message}")
 
 if submitted:
     # Do not leave an earlier result visible when a new submission is invalid.

@@ -1,4 +1,4 @@
-# Funding Matcher
+# Funding Match System
 
 Runnable backend prototype for:
 
@@ -15,11 +15,13 @@ from environment variables and are never written to the database.
 ## Quick start
 
 ```bash
+cd funding_match_system
 python run_pipeline.py demo --reset
 ```
 
 This creates:
 
+- `data/funding_match.db`
 - `output/demo_matches.csv`
 
 ## Key-free preview using Xin Yuan's profile
@@ -87,18 +89,26 @@ After a new researcher is matched, the three generated themes are written back
 into the Theme 1–3 fields for review. Each generated theme also lists the
 Scopus publication title(s) recorded as evidence for that theme.
 
-The web workflow first imports the requested number of recent Scopus
-publication titles and generates 12 candidate keywords. The researcher then
-selects a non-overlapping keyword scope for each of three themes. Each imported
-paper is assigned to only its strongest matching keyword group, so the
-evidence-paper lists do not overlap across themes. The **Start a new search**
-button clears the previous profile, keywords, generated themes, and results,
-then opens a blank new-researcher form.
+The web workflow offers two keyword modes. **Import Indexed Keywords/MeSH from
+Scopus** retrieves each selected paper's Abstract Retrieval metadata and ranks
+the indexed terms appearing across the papers; it does not infer keywords from
+title word frequency. **Enter keywords manually** accepts three freely entered,
+comma-separated keyword groups. In either mode, the researcher defines a
+non-overlapping scope for three themes. Each imported paper is assigned to only
+its strongest matching group, so the evidence-paper lists do not overlap.
+
+The default example profile is Dajiang Liu (faculty, Penn State College of
+Medicine, United States, independent PI, no animal-model work) with the Scopus
+Author ID shown in the web form. **Start a new search** clears the previous
+profile, keywords, generated themes, and results, then opens a blank
+new-researcher form.
 
 For a public Streamlit deployment, API keys can be supplied either through
 Streamlit Secrets or temporarily through the password fields under **API
 access**. Session-entered keys are passed in a per-request configuration and
 are not written to `.env`, the database, or the repository.
+The web app also passes each session key explicitly to its API client, avoiding
+deployment-specific environment/config propagation issues.
 
 If `SIMPLER_GRANTS_API_KEY` is also configured, the page can search live
 opportunities from Simpler.Grants.gov. Otherwise it uses the included dated
