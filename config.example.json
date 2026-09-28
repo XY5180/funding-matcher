@@ -15,6 +15,7 @@
     "base_url": "https://api.elsevier.com/content",
     "api_key_env": "SCOPUS_API_KEY",
     "institution_token_env": "SCOPUS_INST_TOKEN",
+    "search_page_size": 25,
     "publication_start_year": 2019
   },
   "simpler_grants": {
@@ -25,4 +26,3 @@
     "statuses": ["posted", "forecasted"]
   }
 }
-

@@ -231,6 +231,72 @@ def sync_scopus(conn, config):
     conn.commit()
     return written
 
+def import_scopus_researcher(conn, config, researcher_id, max_publications=20):
+    """Enrich one manually entered researcher without requiring Pure."""
+    researcher = conn.execute(
+        "SELECT * FROM researchers WHERE researcher_id=?", (researcher_id,)
+    ).fetchone()
+    if not researcher:
+        raise ValueError(f"Unknown researcher: {researcher_id}")
+    client = ScopusClient(config)
+    author_id = (researcher["scopus_author_id"] or "").strip()
+    if not author_id:
+        orcid = (researcher["orcid"] or "").strip()
+        if not orcid:
+            raise ValueError("Enter an ORCID or Scopus Author ID before importing publications")
+        entries = client.author_search(f"ORCID({orcid})").get("search-results", {}).get("entry", [])
+        if len(entries) != 1:
+            raise ValueError(
+                f"Scopus author lookup returned {len(entries)} records for ORCID {orcid}; "
+                "enter the Scopus Author ID to select the correct author"
+            )
+        author_id = entries[0].get("dc:identifier", "").replace("AUTHOR_ID:", "")
+        conn.execute("UPDATE researchers SET scopus_author_id=? WHERE researcher_id=?",
+                     (author_id, researcher_id))
+
+    written = 0
+    for entry in client.publications(author_id):
+        if written >= max_publications:
+            break
+        eid = entry.get("eid", "")
+        sid = entry.get("dc:identifier", "").replace("SCOPUS_ID:", "")
+        doi = (entry.get("prism:doi") or "").lower()
+        output_id = "scopus:" + (sid or eid)
+        abstract = ""
+        if eid:
+            try:
+                detail = client.abstract(eid)
+                abstract = detail.get("abstracts-retrieval-response", {}).get(
+                    "coredata", {}).get("dc:description") or ""
+            except RuntimeError:
+                # Search metadata is still useful when abstract entitlement is unavailable.
+                abstract = ""
+        row = {
+            "output_id": output_id, "pure_output_id": None, "scopus_id": sid,
+            "eid": eid, "doi": doi, "pmid": entry.get("pubmed-id"),
+            "title": entry.get("dc:title") or output_id, "abstract": abstract,
+            "publication_date": entry.get("prism:coverDate"),
+            "output_type": entry.get("subtypeDescription"),
+            "journal": entry.get("prism:publicationName"),
+            "citation_count": int(entry.get("citedby-count") or 0),
+            "source_updated_at": utcnow(), "raw_json": entry,
+        }
+        try:
+            upsert(conn, "research_outputs", row, ["output_id"])
+        except Exception:
+            existing = conn.execute(
+                "SELECT output_id FROM research_outputs WHERE doi=?", (doi,)
+            ).fetchone()
+            output_id = existing["output_id"] if existing else output_id
+        upsert(conn, "researcher_outputs", {
+            "researcher_id": researcher_id, "output_id": output_id,
+            "author_position": None, "corresponding_author": None,
+            "source": "scopus",
+        }, ["researcher_id", "output_id"])
+        written += 1
+    conn.commit()
+    return written, author_id
+
 def sync_grants(conn, config, query=""):
     n = 0
     for raw in SimplerGrantsClient(config).opportunities(query):
@@ -248,8 +314,13 @@ def phrases(text, vocabulary):
     lower = (text or "").lower()
     return sorted(p for p in vocabulary if p in lower)
 
-def build_profiles(conn, max_themes=3):
-    researchers = conn.execute("SELECT * FROM researchers").fetchall()
+def build_profiles(conn, max_themes=3, seed_keywords=None, researcher_id=None):
+    if researcher_id:
+        researchers = conn.execute(
+            "SELECT * FROM researchers WHERE researcher_id=?", (researcher_id,)
+        ).fetchall()
+    else:
+        researchers = conn.execute("SELECT * FROM researchers").fetchall()
     written = 0
     for researcher in researchers:
         rows = conn.execute("""SELECT o.* FROM research_outputs o JOIN researcher_outputs ro
@@ -265,6 +336,77 @@ def build_profiles(conn, max_themes=3):
             raw = json.loads(researcher["raw_json"] or "{}")
             texts = [str(first(raw, "profileInformation.researchInterests.text",
                                "researchInterests", default=researcher["title"] or ""))]
+
+        if seed_keywords:
+            seeds = []
+            for group in seed_keywords[:max_themes]:
+                cleaned = [str(keyword).strip().lower() for keyword in group
+                           if str(keyword).strip()]
+                seeds.append(list(dict.fromkeys(cleaned)))
+            seeds += [[] for _ in range(max_themes - len(seeds))]
+
+            # Assign every publication/project to at most one theme. Exact
+            # phrases receive more weight than individual token overlap, and
+            # unmatched evidence is not forced into an unrelated theme.
+            assignments = [[] for _ in range(max_themes)]
+            for text_index, text in enumerate(texts):
+                lower = text.lower()
+                text_terms = set(terms(text))
+                scores = []
+                for group in seeds:
+                    score = 0
+                    for keyword in group:
+                        keyword_terms = set(terms(keyword))
+                        if keyword and keyword in lower:
+                            score += 4 + len(keyword_terms)
+                        score += len(keyword_terms & text_terms)
+                    scores.append(score)
+                best_score = max(scores, default=0)
+                if best_score > 0:
+                    assignments[scores.index(best_score)].append(text_index)
+
+            conn.execute(
+                "DELETE FROM research_themes WHERE researcher_id=? AND manually_verified=0",
+                (researcher["researcher_id"],))
+            for idx, group in enumerate(seeds):
+                if not group:
+                    continue
+                assigned = assignments[idx]
+                theme_texts = [texts[i] for i in assigned]
+                analysis_texts = theme_texts or [" ".join(group)]
+                df = Counter(t for text in analysis_texts for t in set(terms(text)))
+                scored = Counter()
+                for text in analysis_texts:
+                    counts = Counter(terms(text))
+                    for term, count in counts.items():
+                        scored[term] += count * (
+                            math.log((1 + len(analysis_texts)) / (1 + df[term])) + 1)
+                top = [term for term, _ in scored.most_common(24)]
+                keywords = list(dict.fromkeys(group + top))[:24]
+                evidence = [rows[i]["output_id"] for i in assigned
+                            if i < len(rows)][:12]
+                combined = " ".join(theme_texts[:12])
+                digest = hashlib.sha1(
+                    f"{researcher['researcher_id']}:seeded:{idx}".encode()
+                ).hexdigest()[:10]
+                # Prefix preserves Theme 1/2/3 order when the UI reads rows.
+                tid = f"seeded-{idx + 1}-{digest}"
+                row = {
+                    "theme_id": tid, "researcher_id": researcher["researcher_id"],
+                    "theme_name": " / ".join(group[:3]),
+                    "summary": " ".join(top[:15]) or " ".join(group),
+                    "keywords": keywords,
+                    "methods": phrases(combined, METHODS),
+                    "diseases": [], "populations": [],
+                    "data_types": phrases(combined, DATA_TYPES),
+                    "evidence_output_ids": evidence,
+                    "confidence": min(1.0, 0.35 + 0.08 * len(evidence)),
+                    "manually_verified": 0, "generated_at": utcnow(),
+                }
+                upsert(conn, "research_themes", row, ["theme_id"])
+                written += 1
+            continue
+
         # Transparent topic construction: top weighted terms, split by recent evidence.
         df = Counter(t for text in texts for t in set(terms(text)))
         scored = Counter()

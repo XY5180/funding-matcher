@@ -2,6 +2,7 @@
 """Streamlit front end for the existing funding-match backend."""
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -9,11 +10,13 @@ import streamlit as st
 
 from funding_match.clients import utcnow
 from funding_match.db import connect, upsert
-from funding_match.pipeline import match_all
+from funding_match.pipeline import (build_profiles, import_scopus_researcher,
+                                    match_all, sync_grants)
 
 
 ROOT = Path(__file__).resolve().parent
 SNAPSHOT = ROOT / "quick_opportunities.json"
+CONFIG = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
 
 
 def split_terms(value):
@@ -22,7 +25,8 @@ def split_terms(value):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def run_match(profile, themes):
+def run_match(profile, themes, use_scopus=False, max_publications=20,
+              use_live_grants=False, funding_query="", seed_keywords=None):
     """Run one isolated match without changing the command-line database."""
     with tempfile.TemporaryDirectory(prefix="funding-match-") as tmp:
         conn = connect(Path(tmp) / "web-demo.db")
@@ -37,8 +41,8 @@ def run_match(profile, themes):
         researcher = {
             "researcher_id": "web-form-researcher",
             "pure_person_id": None,
-            "scopus_author_id": None,
-            "orcid": None,
+            "scopus_author_id": profile["scopus_author_id"] or None,
+            "orcid": profile["orcid"] or None,
             "name": profile["name"],
             "email": profile["email"],
             "title": profile["title"],
@@ -70,11 +74,75 @@ def run_match(profile, themes):
                 "generated_at": utcnow(),
             }, ["theme_id"])
 
-        snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
-        for opportunity in snapshot["opportunities"]:
-            upsert(conn, "opportunities", opportunity, ["opportunity_id"])
+        imported_publications = 0
+        resolved_author_id = profile["scopus_author_id"]
+        if use_scopus:
+            imported_publications, resolved_author_id = import_scopus_researcher(
+                conn, CONFIG, "web-form-researcher", max_publications=max_publications)
+            build_profiles(
+                conn, max_themes=3, seed_keywords=seed_keywords,
+                researcher_id="web-form-researcher")
+
+        funding_warning = None
+
+        def load_snapshot():
+            snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+            for opportunity in snapshot["opportunities"]:
+                upsert(conn, "opportunities", opportunity, ["opportunity_id"])
+            return (len(snapshot["opportunities"]),
+                    f"Snapshot {snapshot['snapshot_date']}")
+
+        if use_live_grants:
+            try:
+                opportunity_count = sync_grants(conn, CONFIG, funding_query)
+                if not opportunity_count:
+                    raise ValueError(
+                        "Simpler.Grants.gov returned no opportunities for this query")
+                funding_source = "Live Simpler.Grants.gov search"
+            except (RuntimeError, ValueError) as exc:
+                opportunity_count, funding_source = load_snapshot()
+                if "HTTP 401" in str(exc) or "Invalid API key" in str(exc):
+                    funding_warning = (
+                        "Simpler.Grants.gov rejected the API key (HTTP 401). "
+                        "The included funding snapshot was used instead. Check "
+                        "SIMPLER_GRANTS_API_KEY, then restart the app.")
+                else:
+                    funding_warning = (
+                        "The live Simpler.Grants.gov search was unavailable, so "
+                        "the included funding snapshot was used instead.")
+        else:
+            opportunity_count, funding_source = load_snapshot()
         conn.commit()
         match_all(conn)
+
+        generated_themes = []
+        generated_rows = conn.execute("""
+            SELECT * FROM research_themes
+            WHERE researcher_id='web-form-researcher' AND manually_verified=0
+            ORDER BY theme_id
+        """).fetchall()
+        for theme in generated_rows:
+            evidence_ids = json.loads(theme["evidence_output_ids"] or "[]")
+            evidence_papers = []
+            if evidence_ids:
+                placeholders = ",".join("?" for _ in evidence_ids)
+                paper_rows = conn.execute(
+                    f"SELECT output_id, title, publication_date FROM research_outputs "
+                    f"WHERE output_id IN ({placeholders})", evidence_ids
+                ).fetchall()
+                by_id = {paper["output_id"]: dict(paper) for paper in paper_rows}
+                evidence_papers = [by_id[output_id] for output_id in evidence_ids
+                                   if output_id in by_id]
+            generated_themes.append({
+                "name": theme["theme_name"] or "",
+                "summary": theme["summary"] or "",
+                "keywords": json.loads(theme["keywords"] or "[]"),
+                "methods": json.loads(theme["methods"] or "[]"),
+                "diseases": json.loads(theme["diseases"] or "[]"),
+                "populations": json.loads(theme["populations"] or "[]"),
+                "data_types": json.loads(theme["data_types"] or "[]"),
+                "evidence_papers": evidence_papers,
+            })
 
         opportunity_rows = conn.execute("""
             SELECT m.scientific_fit, m.eligibility_status,
@@ -104,13 +172,15 @@ def run_match(profile, themes):
                      tm.scientific_fit DESC
         """).fetchall()
         return ([dict(row) for row in opportunity_rows],
-                [dict(row) for row in theme_rows], snapshot["snapshot_date"])
+                [dict(row) for row in theme_rows], funding_source,
+                imported_publications, resolved_author_id, opportunity_count,
+                funding_warning, generated_themes)
 
 
 def render_results(rows, snapshot_date):
     st.subheader("Ranked funding matches")
     st.caption(
-        f"Funding snapshot: {snapshot_date}. Scientific fit is a transparent "
+        f"Funding source: {snapshot_date}. Scientific fit is a transparent "
         "text-similarity baseline, not an application-success probability."
     )
     for rank, row in enumerate(rows, start=1):
@@ -219,58 +289,176 @@ st.set_page_config(page_title="Funding Match", page_icon="🔎", layout="wide")
 st.title("Funding Match")
 st.write("Enter a researcher profile, rank funding opportunities, and review eligibility separately.")
 
-with st.form("researcher-form"):
+if st.button("Start a new search", help="Clear the previous profile, themes, and results."):
+    st.session_state.clear()
+    st.session_state["profile-mode"] = "New researcher"
+    st.rerun()
+
+profile_mode = st.radio(
+    "Profile mode",
+    ["Default example profile", "New researcher"],
+    horizontal=True,
+    key="profile-mode",
+    help=("Use the existing demonstration profile, or start with a completely "
+          "blank researcher profile."),
+)
+use_default_profile = profile_mode == "Default example profile"
+mode_key = "default" if use_default_profile else "new"
+generated_theme_store = st.session_state.get("generated_themes", {})
+generated_theme_cache = generated_theme_store.get(mode_key, [])
+theme_revision = st.session_state.get(f"theme_revision_{mode_key}", 0)
+
+profile_defaults = {
+    "name": "Xin Yuan" if use_default_profile else "",
+    "title": "Postdoctoral Researcher" if use_default_profile else "",
+    "organization": "Penn State College of Medicine" if use_default_profile else "",
+    "email": "",
+    "orcid": "",
+    "country": "US" if use_default_profile else "",
+    "scopus_author_id": "55848832700" if use_default_profile else "",
+}
+
+with st.form(f"researcher-form-{mode_key}"):
     st.subheader("1. Researcher profile")
     col1, col2 = st.columns(2)
     with col1:
-        name = st.text_input("Name *", "Xin Yuan")
-        title = st.text_input("Current title", "Postdoctoral Researcher")
-        organization = st.text_input("Organization", "Penn State College of Medicine")
-        email = st.text_input("Email (optional)", "")
+        name = st.text_input("Name *", profile_defaults["name"], key=f"profile-name-{mode_key}")
+        title = st.text_input("Current title", profile_defaults["title"], key=f"profile-title-{mode_key}")
+        organization = st.text_input("Organization", profile_defaults["organization"], key=f"profile-org-{mode_key}")
+        email = st.text_input("Email (optional)", profile_defaults["email"], key=f"profile-email-{mode_key}")
+        orcid = st.text_input(
+            "ORCID (optional)", profile_defaults["orcid"],
+            placeholder="0000-0000-0000-0000", key=f"profile-orcid-{mode_key}")
     with col2:
         career_stage = st.selectbox(
             "Career stage",
-            ["postdoc", "faculty", "student", "staff scientist", "other"],
+            ["", "postdoc", "faculty", "student", "staff scientist", "other"],
+            index=1 if use_default_profile else 0,
+            key=f"profile-career-{mode_key}",
         )
-        country = st.text_input("Country", "US")
-        pi_answer = st.selectbox("Independent PI?", ["Unknown", "No", "Yes"])
-        animal_answer = st.selectbox("Works with animal models?", ["Unknown", "No", "Yes"])
+        country = st.text_input("Country", profile_defaults["country"], key=f"profile-country-{mode_key}")
+        pi_answer = st.selectbox(
+            "Independent PI?", ["", "No", "Yes"], key=f"profile-pi-{mode_key}")
+        animal_answer = st.selectbox(
+            "Works with animal models?", ["", "No", "Yes"], key=f"profile-animal-{mode_key}")
+        scopus_author_id = st.text_input(
+            "Scopus Author ID (optional)", profile_defaults["scopus_author_id"],
+            key=f"profile-scopus-{mode_key}")
 
-    st.subheader("2. Research themes")
-    st.caption("The first theme is required. Leave theme 2 or 3 blank if not needed.")
-    defaults = [
+    scopus_ready = bool(os.environ.get("SCOPUS_API_KEY", "").strip())
+    use_scopus = st.checkbox(
+        "Import publications from Scopus",
+        value=scopus_ready,
+        disabled=not scopus_ready,
+        key=f"use-scopus-{mode_key}",
+        help=("Uses SCOPUS_API_KEY from the server environment."
+              if scopus_ready else
+              "Set SCOPUS_API_KEY locally or in Streamlit Secrets to enable this option."),
+    )
+    if not scopus_ready:
+        st.caption("Scopus enrichment is currently off because SCOPUS_API_KEY is not configured.")
+
+    st.subheader("2. Theme seed keywords")
+    st.caption(
+        "Enter several keywords for each theme. Imported Scopus papers are "
+        "assigned to the single best-matching theme before that theme is generated."
+    )
+    default_seed_values = [
+        "electronic health records, language model embeddings, cancer risk",
+        "GWAS, statistical genetics, multi-omics, biobank",
+        "medical imaging, oral cancer, MRI, segmentation",
+    ] if use_default_profile else ["", "", ""]
+    seed_columns = st.columns(3)
+    theme_seed_inputs = []
+    for seed_index, column in enumerate(seed_columns, start=1):
+        with column:
+            theme_seed_inputs.append(st.text_area(
+                f"Theme {seed_index} keywords",
+                default_seed_values[seed_index - 1],
+                key=f"seed-keywords-{mode_key}-{seed_index}",
+                placeholder="keyword 1, keyword 2, keyword 3",
+                height=100,
+            ))
+
+    include_manual_themes = st.checkbox(
+        "Also include the manually entered themes below",
+        value=False,
+        disabled=not use_scopus,
+        key=f"include-manual-{mode_key}",
+        help=("Off: match only with themes generated from Scopus publications. "
+              "On: combine Scopus-generated themes with the themes entered below."),
+    )
+
+    st.subheader("3. Generated research themes")
+    if use_scopus and not include_manual_themes:
+        st.caption(
+            "Scopus-only mode is active. The fields below are ignored; themes "
+            "will be generated from imported publication titles and abstracts."
+        )
+    else:
+        st.caption("The first theme is required. Leave theme 2 or 3 blank if not needed.")
+    example_theme_defaults = [
         (
-            "Interpretable embedding for longitudinal EHRs",
+            "Interpretable AI for longitudinal electronic health records",
             "Machine learning, language-model embeddings and interpretable representation learning for longitudinal EHR, phecodes, clinical trajectories and cancer risk prediction.",
-            "EHR, electronic health records, machine learning, embeddings",
+            "EHR, electronic health records, machine learning, embeddings, cancer risk",
             "machine learning, artificial intelligence, natural language processing",
             "cancer", "patients", "EHR, clinical data",
         ),
         (
             "Statistical genetics and multi-omics",
-            "GWAS, statistical genetics, using segmentation as a quantitative phenotype.",
-            "GWAS, statistical genetics, functional genomics, multi-omics, biobank, MRI image",
+            "GWAS, statistical genetics, causal inference and integration of multi-omics with phenotypes in population biobanks.",
+            "GWAS, statistical genetics, functional genomics, multi-omics, biobank",
             "statistical genetics, causal inference, bioinformatics",
             "complex disease", "population biobank", "genomics, multi-omics, biobank",
         ),
         (
-            "AI medical imaging for oral cancer",
-            "Deep-learning classification and segmentation for oral cancer, potentially malignant disorders.",
-            "medical imaging, segmentation, oral cancer, deep learning",
+            "AI medical imaging for oral cancer and abdominal MRI",
+            "Deep-learning classification and segmentation for oral cancer, potentially malignant disorders and quantitative abdominal MRI.",
+            "medical imaging, segmentation, oral cancer, MRI, deep learning",
             "deep learning, imaging, segmentation",
-            "oral cancer", "patients", "imaging",
+            "oral cancer", "patients", "imaging, MRI",
         ),
     ]
+    blank_theme = ("", "", "", "", "", "", "")
+    generated_defaults = [(
+        theme.get("name", ""),
+        theme.get("summary", ""),
+        ", ".join(theme.get("keywords", [])),
+        ", ".join(theme.get("methods", [])),
+        ", ".join(theme.get("diseases", [])),
+        ", ".join(theme.get("populations", [])),
+        ", ".join(theme.get("data_types", [])),
+    ) for theme in generated_theme_cache[:3]]
+    generated_defaults += [blank_theme] * (3 - len(generated_defaults))
+    defaults = (example_theme_defaults if use_default_profile
+                else generated_defaults)
     entered_themes = []
     for index, values in enumerate(defaults, start=1):
         with st.expander(f"Theme {index}", expanded=index == 1):
-            theme_name = st.text_input("Theme name", values[0], key=f"name-{index}")
-            summary = st.text_area("Research summary", values[1], key=f"summary-{index}")
-            keywords = st.text_area("Keywords", values[2], key=f"keywords-{index}")
-            methods = st.text_input("Methods", values[3], key=f"methods-{index}")
-            diseases = st.text_input("Diseases/domains", values[4], key=f"diseases-{index}")
-            populations = st.text_input("Populations", values[5], key=f"populations-{index}")
-            data_types = st.text_input("Data types", values[6], key=f"data-{index}")
+            theme_name = st.text_input(
+                "Theme name", values[0], key=f"name-{mode_key}-{theme_revision}-{index}")
+            summary = st.text_area(
+                "Research summary", values[1], key=f"summary-{mode_key}-{theme_revision}-{index}")
+            keywords = st.text_area(
+                "Keywords", values[2], key=f"keywords-{mode_key}-{theme_revision}-{index}")
+            methods = st.text_input(
+                "Methods", values[3], key=f"methods-{mode_key}-{theme_revision}-{index}")
+            diseases = st.text_input(
+                "Diseases/domains", values[4], key=f"diseases-{mode_key}-{theme_revision}-{index}")
+            populations = st.text_input(
+                "Populations", values[5], key=f"populations-{mode_key}-{theme_revision}-{index}")
+            data_types = st.text_input(
+                "Data types", values[6], key=f"data-{mode_key}-{theme_revision}-{index}")
+            if index <= len(generated_theme_cache):
+                papers = generated_theme_cache[index - 1].get("evidence_papers", [])
+                st.markdown("**Scopus papers supporting this theme**")
+                if papers:
+                    for paper in papers:
+                        date = paper.get("publication_date") or "date unavailable"
+                        st.markdown(f"- {paper.get('title', 'Untitled')} ({date})")
+                else:
+                    st.caption("No individual evidence paper was recorded for this theme.")
             entered_themes.append({
                 "name": theme_name.strip(),
                 "summary": summary.strip(),
@@ -281,40 +469,97 @@ with st.form("researcher-form"):
                 "data_types": split_terms(data_types),
             })
 
-    st.subheader("3. Result settings")
+    st.subheader("4. Result settings")
     settings_col1, settings_col2 = st.columns(2)
     with settings_col1:
         top_k = st.selectbox("Recommendations per theme", [3, 5, 10], index=1)
     with settings_col2:
         minimum_fit = st.selectbox("Minimum scientific fit", [0, 10, 20, 30, 40], index=0)
+    max_publications = st.selectbox("Maximum Scopus publications to import", [10, 20, 50], index=1,
+                                    disabled=not use_scopus)
+    grants_ready = bool(os.environ.get("SIMPLER_GRANTS_API_KEY", "").strip())
+    use_live_grants = st.checkbox(
+        "Search live opportunities from Simpler.Grants.gov",
+        value=False, disabled=not grants_ready,
+        help=("Uses SIMPLER_GRANTS_API_KEY from the server environment."
+              if grants_ready else
+              "Set SIMPLER_GRANTS_API_KEY to enable live funding search."),
+    )
+    funding_query = st.text_input(
+        "Funding search terms",
+        "cancer genomics electronic health records medical imaging",
+        disabled=not use_live_grants,
+    )
 
     submitted = st.form_submit_button("Find funding opportunities", type="primary")
 
 if submitted:
+    # Do not leave an earlier result visible when a new submission is invalid.
+    st.session_state.pop("match_results", None)
     valid_themes = [theme for theme in entered_themes if theme["name"] and theme["summary"]]
+    seed_keywords = [split_terms(value) for value in theme_seed_inputs]
+    themes_for_match = (valid_themes if (not use_scopus or include_manual_themes)
+                        else [])
     if not name.strip():
         st.error("Name is required.")
-    elif not valid_themes:
+    elif use_scopus and any(not group for group in seed_keywords):
+        st.error("Enter at least one seed keyword for each of the three themes.")
+    elif not use_scopus and not valid_themes:
         st.error("Enter at least one research theme with a name and summary.")
     else:
-        tri_state = {"Unknown": None, "No": 0, "Yes": 1}
+        tri_state = {"": None, "No": 0, "Yes": 1}
         profile = {
             "name": name.strip(), "email": email.strip(), "title": title.strip(),
             "organization": organization.strip(), "career_stage": career_stage,
             "country": country.strip(), "independent_pi": tri_state[pi_answer],
             "works_with_animals": tri_state[animal_answer],
+            "orcid": orcid.strip(), "scopus_author_id": scopus_author_id.strip(),
         }
         try:
-            opportunity_rows, theme_rows, snapshot_date = run_match(profile, valid_themes)
+            with st.spinner(
+                "Importing Scopus papers, generating themes, and matching funding..."
+            ):
+                (opportunity_rows, theme_rows, snapshot_date, imported_count,
+                 resolved_author_id, opportunity_count, funding_warning,
+                 generated_themes) = run_match(
+                    profile, themes_for_match, use_scopus=use_scopus,
+                    max_publications=max_publications,
+                    use_live_grants=use_live_grants,
+                    funding_query=funding_query.strip(),
+                    seed_keywords=seed_keywords if use_scopus else None)
             st.session_state["match_results"] = (
-                opportunity_rows, theme_rows, snapshot_date, top_k, minimum_fit)
+                opportunity_rows, theme_rows, snapshot_date, top_k, minimum_fit,
+                imported_count, resolved_author_id, opportunity_count,
+                funding_warning)
+            if mode_key == "new" and use_scopus and generated_themes:
+                updated_store = dict(st.session_state.get("generated_themes", {}))
+                updated_store[mode_key] = generated_themes[:3]
+                st.session_state["generated_themes"] = updated_store
+                st.session_state[f"theme_revision_{mode_key}"] = theme_revision + 1
+                st.rerun()
         except Exception as exc:
-            st.exception(exc)
+            message = str(exc)
+            if "APIKEY_INVALID" in message or ("HTTP 401" in message and "elsevier" in message):
+                st.error(
+                    "Scopus rejected SCOPUS_API_KEY. Create or copy a valid key, "
+                    "update .env (or Streamlit Secrets), restart the app, and try again."
+                )
+            else:
+                st.exception(exc)
 
 if "match_results" in st.session_state:
-    result_rows, theme_rows, result_snapshot, result_top_k, result_minimum = st.session_state["match_results"]
+    (result_rows, theme_rows, result_snapshot, result_top_k, result_minimum,
+     imported_count, resolved_author_id,
+     opportunity_count, funding_warning) = st.session_state["match_results"]
     if result_rows:
-        st.caption(f"Funding snapshot: {result_snapshot}")
+        if funding_warning:
+            st.warning(funding_warning)
+        if imported_count:
+            st.success(
+                f"Imported {imported_count} Scopus publications "
+                f"(Author ID: {resolved_author_id})."
+            )
+        st.caption(f"Funding source: {result_snapshot} · {opportunity_count} opportunities")
         theme_tab, opportunity_tab = st.tabs([
             "Top matches by research theme", "Best theme for each opportunity"
         ])

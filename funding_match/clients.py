@@ -5,6 +5,26 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
+
+def load_local_env(path=None):
+    """Load a local .env file without overriding existing environment values."""
+    source = Path(path) if path else Path(__file__).resolve().parents[1] / ".env"
+    if not source.exists():
+        return
+    for raw_line in source.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if value[:1] == value[-1:] and value[:1] in {'"', "'"}:
+            value = value[1:-1]
+        if name and name.replace("_", "").isalnum():
+            os.environ.setdefault(name, value)
+
+load_local_env()
 
 def utcnow():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -94,10 +114,14 @@ class ScopusClient:
     def publications(self, author_id):
         start = 0
         year = self.cfg.get("publication_start_year")
+        # Scopus permits different page sizes depending on the API key's
+        # service level. 25 works for the basic developer tier; larger import
+        # limits are handled by pagination rather than an oversized request.
+        page_size = max(1, min(int(self.cfg.get("search_page_size", 25)), 25))
         query = f"AU-ID({author_id})" + (f" AND PUBYEAR AFT {int(year)-1}" if year else "")
         while True:
             url = self.base + "/search/scopus?" + urllib.parse.urlencode(
-                {"query": query, "start": start, "count": 200, "view": "STANDARD",
+                {"query": query, "start": start, "count": page_size, "view": "STANDARD",
                  "sort": "-coverDate"})
             payload = request_json(url, self.headers)
             block = payload.get("search-results", {})
