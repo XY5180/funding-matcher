@@ -1,4 +1,4 @@
-# Funding Match System
+# Funding Matcher
 
 Runnable backend prototype for:
 
@@ -15,7 +15,6 @@ from environment variables and are never written to the database.
 ## Quick start
 
 ```bash
-cd funding_match_system
 python run_pipeline.py demo --reset
 ```
 
