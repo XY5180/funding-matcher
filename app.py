@@ -244,6 +244,9 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                    m.domain_score, m.evidence_score, m.semantic_score,
                    m.llm_score, m.model_version, m.eligibility_status,
                    m.eligibility_reasons, m.matched_terms, m.explanation,
+                   m.alignment_label, m.disease_match_score,
+                   m.population_match_score, m.mechanism_fit_score,
+                   m.hard_mismatch, m.mismatch_reason,
                    t.theme_name, t.coherence_score AS theme_coherence_score,
                    t.separation_score AS theme_separation_score,
                    t.stability_score AS theme_stability_score,
@@ -263,6 +266,9 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                    tm.domain_score, tm.evidence_score, tm.semantic_score,
                    tm.llm_score, tm.model_version, tm.eligibility_status,
                    tm.eligibility_reasons, tm.matched_terms, tm.explanation,
+                   tm.alignment_label, tm.disease_match_score,
+                   tm.population_match_score, tm.mechanism_fit_score,
+                   tm.hard_mismatch, tm.mismatch_reason,
                    t.theme_name, t.theme_id,
                    t.coherence_score AS theme_coherence_score,
                    t.separation_score AS theme_separation_score,
@@ -290,7 +296,7 @@ def render_score_details(row):
     labels = [
         ("Topic", "topic_score"), ("Semantic", "semantic_score"),
         ("LLM review", "llm_score"), ("Method", "method_score"),
-        ("Domain", "domain_score"), ("Paper evidence", "evidence_score"),
+        ("Domain", "domain_score"),
     ]
     for label, key in labels:
         value = row.get(key)
@@ -298,17 +304,58 @@ def render_score_details(row):
             parts.append(f"{label} {float(value):.1f}")
     if parts:
         st.caption("Score components: " + " · ".join(parts))
+    if row.get("evidence_score") is not None:
+        st.caption(
+            f"Research evidence strength: {float(row['evidence_score']):.1f}/100 "
+            "(reported separately; not used in Scientific fit)."
+        )
+    alignment = row.get("alignment_label")
+    alignment_parts = []
+    for label, key in [
+        ("Disease", "disease_match_score"),
+        ("Population", "population_match_score"),
+        ("Mechanism", "mechanism_fit_score"),
+    ]:
+        value = row.get(key)
+        if value is not None:
+            alignment_parts.append(f"{label} {float(value):.0f}/100")
+    if alignment or alignment_parts:
+        label_text = (alignment or "not reviewed").replace("_", " ").title()
+        st.caption(
+            f"Alignment class: {label_text}"
+            + (" · " + " · ".join(alignment_parts) if alignment_parts else "")
+        )
+    if row.get("hard_mismatch") or row.get("mismatch_reason"):
+        st.warning(
+            "Mismatch check: "
+            + (row.get("mismatch_reason") or
+               "A material disease or population mismatch was detected.")
+        )
     if row.get("explanation"):
         st.write("**Why this match:** " + row["explanation"])
 
 
-def render_results(rows, snapshot_date):
+def match_band(score):
+    if score >= 70:
+        return "Strong match"
+    if score >= 50:
+        return "Possible match"
+    if score >= 35:
+        return "Adjacent opportunity"
+    return "Not recommended"
+
+
+def render_results(rows, snapshot_date, minimum_fit):
     st.subheader("Ranked funding matches")
     st.caption(
         f"Funding source: {snapshot_date}. Scientific fit measures research "
         "alignment and is not an application-success probability."
     )
-    for rank, row in enumerate(rows, start=1):
+    display_rows = [row for row in rows if row["scientific_fit"] >= minimum_fit]
+    if not display_rows:
+        st.warning("No strong match was found above the selected scientific-fit threshold.")
+        return
+    for rank, row in enumerate(display_rows, start=1):
         reasons = json.loads(row["eligibility_reasons"] or "[]")
         matched = json.loads(row["matched_terms"] or "[]")
         with st.container(border=True):
@@ -321,16 +368,17 @@ def render_results(rows, snapshot_date):
                 )
             with right:
                 st.metric("Scientific fit", f"{row['scientific_fit']:.1f}/100")
+                st.caption(match_band(row["scientific_fit"]))
             st.write(f"**Eligibility:** {row['eligibility_status'].upper()}")
             if reasons:
                 st.info("Human review: " + "; ".join(reasons))
             st.write(f"**Best matching theme:** {row['theme_name']}")
-            st.write("**Matched terms:** " + (", ".join(matched) or "None"))
+            st.write("**Exact phrase overlap:** " + (", ".join(matched) or "None"))
             render_score_details(row)
             st.link_button("Open official announcement", row["source_url"])
 
     export_rows = []
-    for row in rows:
+    for row in display_rows:
         export_rows.append({
             **row,
             "eligibility_reasons": "; ".join(json.loads(row["eligibility_reasons"] or "[]")),
@@ -369,7 +417,7 @@ def render_theme_results(rows, top_k, minimum_fit):
         ][:top_k]
         st.markdown(f"### {theme_name}")
         if not eligible_rows:
-            st.warning("No opportunities meet the selected minimum fit.")
+            st.warning("No strong match was found above the selected scientific-fit threshold.")
             continue
         for rank, row in enumerate(eligible_rows, start=1):
             selected.append(row)
@@ -385,10 +433,11 @@ def render_theme_results(rows, top_k, minimum_fit):
                     )
                 with right:
                     st.metric("Scientific fit", f"{row['scientific_fit']:.1f}/100")
+                    st.caption(match_band(row["scientific_fit"]))
                 st.write(f"**Eligibility:** {row['eligibility_status'].upper()}")
                 if reasons:
                     st.info("Human review: " + "; ".join(reasons))
-                st.write("**Matched terms:** " + (", ".join(matched) or "None"))
+                st.write("**Exact phrase overlap:** " + (", ".join(matched) or "None"))
                 render_score_details(row)
                 st.link_button("Open official announcement", row["source_url"],
                                key=f"theme-link-{row['theme_id']}-{row['opportunity_number']}")
@@ -659,7 +708,12 @@ with st.container(border=True):
     with settings_col1:
         top_k = st.selectbox("Recommendations per theme", [3, 5, 10], index=1)
     with settings_col2:
-        minimum_fit = st.selectbox("Minimum scientific fit", [0, 10, 20, 30, 40], index=0)
+        minimum_fit = st.selectbox(
+            "Minimum scientific fit for recommendations",
+            [0, 25, 35, 50, 70], index=2,
+            help=("Matches below this threshold are not recommended. "
+                  "The default threshold is 35/100."),
+        )
     max_publications = st.selectbox("Maximum Scopus publications to import", [10, 20, 50], index=1,
                                     disabled=not use_scopus or manual_theme_mode)
     grants_ready = bool(simpler_grants_api_key)
@@ -773,6 +827,6 @@ if "match_results" in st.session_state:
         with theme_tab:
             render_theme_results(theme_rows, result_top_k, result_minimum)
         with opportunity_tab:
-            render_results(result_rows, result_snapshot)
+            render_results(result_rows, result_snapshot, result_minimum)
     else:
         st.warning("No matching opportunities were found in the current snapshot.")

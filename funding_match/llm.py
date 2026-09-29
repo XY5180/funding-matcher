@@ -107,9 +107,24 @@ RERANK_SCHEMA = {
                 "properties": {
                     "opportunity_id": {"type": "string"},
                     "relevance_score": {"type": "number"},
+                    "alignment_label": {
+                        "type": "string",
+                        "enum": ["unrelated", "generic_overlap", "adjacent",
+                                 "partial_match", "direct_match"],
+                    },
+                    "disease_match_score": {"type": "number"},
+                    "population_match_score": {"type": "number"},
+                    "mechanism_fit_score": {"type": "number"},
+                    "hard_mismatch": {"type": "boolean"},
+                    "mismatch_reason": {"type": "string"},
                     "explanation": {"type": "string"},
                 },
-                "required": ["opportunity_id", "relevance_score", "explanation"],
+                "required": [
+                    "opportunity_id", "relevance_score", "alignment_label",
+                    "disease_match_score", "population_match_score",
+                    "mechanism_fit_score", "hard_mismatch",
+                    "mismatch_reason", "explanation",
+                ],
                 "additionalProperties": False,
             },
         }
@@ -308,7 +323,19 @@ def rerank_opportunities(api_key, theme, opportunities, model="gpt-4o-mini"):
             "this research theme. Consider topic, methods, disease/population, "
             "data type, and whether the award mechanism supports the proposed "
             "research rather than only infrastructure or coordination. Do not "
-            "reward generic words.\n\nTHEME:\n"
+            "reward generic words. Use this strict relevance rubric: 0-15 means "
+            "unrelated; 16-30 means only a generic method or population overlaps; "
+            "31-50 means an adjacent field with a different core question; 51-70 "
+            "means partially direct alignment; 71-85 means highly aligned; 86-100 "
+            "means the disease, question, methods, population, and award mechanism "
+            "are directly aligned. For disease_match_score and "
+            "population_match_score, use 0 for a clear mismatch, 50 when the "
+            "announcement does not specify that facet, and 100 for a direct match. "
+            "Set hard_mismatch=true when the primary disease, target population, "
+            "or scientific objective conflicts with the theme. Infrastructure-only "
+            "or coordinating-center awards must receive mechanism_fit_score <=25 "
+            "unless the theme explicitly proposes that role. The explanation and "
+            "numeric scores must agree.\n\nTHEME:\n"
             + json.dumps(theme, ensure_ascii=False)
             + "\n\nOPPORTUNITIES:\n"
             + json.dumps(compact, ensure_ascii=False)
@@ -322,6 +349,16 @@ def rerank_opportunities(api_key, theme, opportunities, model="gpt-4o-mini"):
             continue
         output[opportunity_id] = {
             "score": max(0.0, min(100.0, float(item["relevance_score"]))),
+            "alignment_label": item["alignment_label"],
+            "disease_match_score": max(
+                0.0, min(100.0, float(item["disease_match_score"]))),
+            "population_match_score": max(
+                0.0, min(100.0, float(item["population_match_score"]))),
+            "mechanism_fit_score": max(
+                0.0, min(100.0, float(item["mechanism_fit_score"]))),
+            "hard_mismatch": bool(item["hard_mismatch"]),
+            "mismatch_reason": " ".join(
+                str(item["mismatch_reason"]).split())[:300],
             "explanation": " ".join(str(item["explanation"]).split())[:500],
         }
     return output

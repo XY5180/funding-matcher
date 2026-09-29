@@ -148,7 +148,7 @@ class SimplerGrantsClient:
         self.key = need_key(config, "simpler_grants", api_key)
         self.headers = {"X-API-Key": self.key, "Content-Type": "application/json"}
 
-    def opportunities(self, query=""):
+    def opportunities(self, query="", query_operator="AND"):
         size = int(self.cfg.get("page_size", 100))
         max_pages = int(self.cfg.get("max_pages", 10))
         statuses = self.cfg.get("statuses", ["posted", "forecasted"])
@@ -158,12 +158,15 @@ class SimplerGrantsClient:
                 "filters": {"opportunity_status": {"one_of": statuses}},
                 "pagination": {
                     "page_offset": page, "page_size": size,
-                    "sort_order": [{"order_by": "post_date", "sort_direction": "descending"}]
+                    "sort_order": [{
+                        "order_by": "relevancy" if query else "post_date",
+                        "sort_direction": "descending",
+                    }]
                 }
             }
             if query:
                 body["query"] = query[:100]
-                body["query_operator"] = "OR"
+                body["query_operator"] = query_operator
             payload = request_json(url, self.headers, body)
             rows = payload.get("data", [])
             yield from rows

@@ -1,4 +1,4 @@
-# Funding Matcher
+# Funding Match System
 
 Runnable backend prototype for:
 
@@ -15,6 +15,7 @@ from environment variables and are never written to the database.
 ## Quick start
 
 ```bash
+cd funding_match_system
 python run_pipeline.py demo --reset
 ```
 
@@ -128,8 +129,9 @@ deployment-specific environment/config propagation issues.
 
 If `SIMPLER_GRANTS_API_KEY` is also configured, the page can search live
 opportunities from Simpler.Grants.gov. Otherwise it uses the included dated
-funding snapshot. Live mode builds a separate query and candidate pool for
-each research theme (up to 50 candidates per theme); users do not need to
+funding snapshot. Live mode builds several precise AND queries for each
+research theme, merges their results, and removes duplicate opportunities
+before ranking (up to 50 unique candidates per theme). Users do not need to
 enter another funding-search query. Neither path requires Pure.
 
 If the Simpler.Grants.gov key is invalid or the live service is temporarily
@@ -238,17 +240,24 @@ Eligibility is reported independently:
 
 Scientific fit is a 0–100 score:
 
-- without OpenAI, the existing transparent TF-IDF/topic, method, domain, and
-  publication-evidence score is used;
-- with OpenAI, the hybrid score emphasizes semantic similarity (45%), retains
-  transparent topic similarity (25%), adds a scientific LLM review (20%), and
-  uses smaller method, domain, and publication-evidence components;
-- the LLM review explicitly checks whether an award supports the research
-  rather than only infrastructure or coordinating-center work.
+- without OpenAI, the transparent TF-IDF/topic, method, and domain scores are
+  used;
+- with OpenAI, the hybrid score emphasizes semantic similarity, retains
+  transparent topic similarity, adds a scientific LLM review, and uses smaller
+  method and domain components;
+- research evidence strength is shown separately and is not part of funding
+  fit;
+- the LLM applies a strict alignment rubric and separately scores disease,
+  population, and funding-mechanism alignment. Unrelated, generic-overlap,
+  disease/population-mismatch, and infrastructure-only results receive hard
+  score caps.
 
 Weights renormalize when a component is unavailable. The CSV includes topic,
 method, domain, evidence, semantic, and LLM component scores so each ranking
-can be reviewed. Scientific fit measures alignment, not application success.
+can be reviewed. The web app recommends only matches at or above the selected
+threshold (35/100 by default); otherwise it displays **No strong match** rather
+than forcing a recommendation. Scientific fit measures alignment, not
+application success.
 
 ## Pure endpoint assumptions
 
