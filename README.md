@@ -94,8 +94,19 @@ groups and generates one theme per group. **Enter themes manually** skips
 Scopus theme generation and matches the entered themes directly.
 
 When `OPENAI_API_KEY` is configured, the first two modes can use `gpt-4o-mini`
-to produce evidence-grounded structured themes. The model is instructed to
-minimize theme overlap and assign each supporting paper to at most one theme.
+to produce evidence-grounded structured themes. Paper title/abstract
+embeddings are clustered before the model sees them, so the model names and
+explains fixed semantic paper groups rather than choosing papers freely.
+Weak semantic outliers may remain unassigned. A second structured model pass
+reviews and revises each theme for internal coherence, specificity, scientific
+question clarity, evidence strength, logical next direction, funding relevance,
+and distinctiveness.
+
+The results show paper-to-theme similarity plus four theme diagnostics:
+within-theme paper coherence, separation from the other themes, clustering
+stability, and final LLM-reviewed theme quality. Supporting papers cannot be
+moved between clusters by the language model.
+
 All three modes can also use `text-embedding-3-small` semantic similarity and
 `gpt-4o-mini` funding reranking. The local transparent algorithm remains
 available and is used automatically if an OpenAI request fails. OpenAI is

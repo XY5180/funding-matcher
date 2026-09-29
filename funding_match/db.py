@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS research_themes(
   theme_id TEXT PRIMARY KEY, researcher_id TEXT, theme_name TEXT,
   summary TEXT, keywords TEXT, methods TEXT, diseases TEXT, populations TEXT,
   data_types TEXT, evidence_output_ids TEXT, confidence REAL,
+  evidence_scores TEXT, excluded_output_ids TEXT, coherence_score REAL, separation_score REAL,
+  stability_score REAL, quality_score REAL, quality_notes TEXT,
   manually_verified INTEGER DEFAULT 0, generated_at TEXT);
 CREATE TABLE IF NOT EXISTS opportunities(
   opportunity_id TEXT PRIMARY KEY, opportunity_number TEXT, title TEXT NOT NULL,
@@ -82,6 +84,17 @@ def connect(path):
         for column in ("semantic_score", "llm_score"):
             if column not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} REAL")
+    theme_columns = {row[1] for row in conn.execute(
+        "PRAGMA table_info(research_themes)")}
+    for column, data_type in (
+        ("evidence_scores", "TEXT"), ("excluded_output_ids", "TEXT"),
+        ("coherence_score", "REAL"),
+        ("separation_score", "REAL"), ("stability_score", "REAL"),
+        ("quality_score", "REAL"), ("quality_notes", "TEXT"),
+    ):
+        if column not in theme_columns:
+            conn.execute(
+                f"ALTER TABLE research_themes ADD COLUMN {column} {data_type}")
     conn.commit()
     return conn
 

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+import statistics
 import urllib.error
 import urllib.request
 
@@ -118,6 +119,173 @@ RERANK_SCHEMA = {
 }
 
 
+def _cosine_vector(left, right):
+    return sum(a * b for a, b in zip(left, right))
+
+
+def _centroid(vectors, indices):
+    if not indices:
+        return [0.0] * len(vectors[0])
+    center = [sum(vectors[index][dim] for index in indices) / len(indices)
+              for dim in range(len(vectors[0]))]
+    norm = math.sqrt(sum(value * value for value in center)) or 1.0
+    return [value / norm for value in center]
+
+
+def _spherical_kmeans(vectors, k=3, initial_index=0, iterations=30):
+    """Small deterministic spherical K-means implementation for <=50 papers."""
+    if len(vectors) < k:
+        raise ValueError(f"At least {k} papers are required for clustering")
+    seeds = [initial_index % len(vectors)]
+    while len(seeds) < k:
+        candidates = [index for index in range(len(vectors)) if index not in seeds]
+        seeds.append(min(
+            candidates,
+            key=lambda index: max(_cosine_vector(vectors[index], vectors[seed])
+                                  for seed in seeds),
+        ))
+    centers = [vectors[index] for index in seeds]
+    assignments = [-1] * len(vectors)
+    for _ in range(iterations):
+        updated = [max(range(k), key=lambda group: _cosine_vector(vector, centers[group]))
+                   for vector in vectors]
+        # Keep every theme populated. Move the least-confident paper from the
+        # largest cluster when an empty cluster occurs.
+        for group in range(k):
+            if group not in updated:
+                largest = max(range(k), key=lambda value: updated.count(value))
+                members = [index for index, value in enumerate(updated) if value == largest]
+                moved = min(members, key=lambda index: _cosine_vector(
+                    vectors[index], centers[largest]))
+                updated[moved] = group
+        if updated == assignments:
+            break
+        assignments = updated
+        centers = [_centroid(vectors, [index for index, value in enumerate(assignments)
+                                      if value == group]) for group in range(k)]
+    return assignments, centers
+
+
+def _coassignment_stability(vectors, baseline, k=3):
+    """Measure whether paper pairs remain together across different seeds."""
+    if len(vectors) <= k:
+        return 0.5
+    agreements = []
+    for initial_index in range(1, min(6, len(vectors))):
+        alternative, _ = _spherical_kmeans(
+            vectors, k=k, initial_index=initial_index)
+        comparisons = []
+        for left in range(len(vectors)):
+            for right in range(left + 1, len(vectors)):
+                comparisons.append(
+                    (baseline[left] == baseline[right]) ==
+                    (alternative[left] == alternative[right]))
+        if comparisons:
+            agreements.append(sum(comparisons) / len(comparisons))
+    return statistics.mean(agreements) if agreements else 1.0
+
+
+def cluster_papers(vectors, seed_vectors=None, k=3):
+    """Cluster papers, reject weak outliers, and calculate coherence metrics."""
+    if seed_vectors:
+        if len(seed_vectors) != k:
+            raise ValueError("Exactly three keyword seed vectors are required")
+        assignments = [max(range(k), key=lambda group: _cosine_vector(
+            vector, seed_vectors[group])) for vector in vectors]
+        # Populate an empty guided theme with its closest paper.
+        for group in range(k):
+            if group not in assignments:
+                candidate = max(range(len(vectors)), key=lambda index: _cosine_vector(
+                    vectors[index], seed_vectors[group]))
+                assignments[candidate] = group
+        centers = [_centroid(vectors, [i for i, value in enumerate(assignments)
+                                      if value == group]) for group in range(k)]
+        margins = []
+        for vector in vectors:
+            scores = sorted((_cosine_vector(vector, seed) for seed in seed_vectors),
+                            reverse=True)
+            margins.append(max(0.0, scores[0] - scores[1]))
+        stability = min(1.0, 0.5 + statistics.mean(margins))
+    else:
+        assignments, centers = _spherical_kmeans(vectors, k=k)
+        stability = _coassignment_stability(vectors, assignments, k=k)
+
+    clusters = []
+    for group in range(k):
+        members = [index for index, value in enumerate(assignments) if value == group]
+        similarities = {index: _cosine_vector(vectors[index], centers[group])
+                        for index in members}
+        retained = list(members)
+        if len(members) >= 3:
+            threshold = max(0.30, statistics.median(similarities.values()) - 0.12)
+            filtered = [index for index in members if similarities[index] >= threshold]
+            if len(filtered) >= 2:
+                retained = filtered
+        center = _centroid(vectors, retained)
+        similarities = {index: _cosine_vector(vectors[index], center)
+                        for index in retained}
+        pairwise = [_cosine_vector(vectors[left], vectors[right])
+                    for position, left in enumerate(retained)
+                    for right in retained[position + 1:]]
+        coherence = statistics.mean(pairwise) if pairwise else 0.0
+        clusters.append({
+            "indices": sorted(retained, key=lambda index: similarities[index],
+                              reverse=True),
+            "outlier_indices": [index for index in members if index not in retained],
+            "center": center,
+            "similarities": similarities,
+            "coherence": max(0.0, min(1.0, coherence)),
+            "stability": max(0.0, min(1.0, stability)),
+        })
+    for group, cluster in enumerate(clusters):
+        other_similarities = [_cosine_vector(cluster["center"], other["center"])
+                              for index, other in enumerate(clusters) if index != group]
+        cluster["separation"] = max(
+            0.0, min(1.0, 1.0 - max(other_similarities, default=0.0)))
+    return clusters
+
+
+CLUSTER_THEME_ITEM = {
+    "type": "object",
+    "properties": {
+        "cluster_id": {"type": "integer"},
+        "name": {"type": "string"},
+        "summary": {"type": "string"},
+        "core_question": {"type": "string"},
+        "scientific_rationale": {"type": "string"},
+        "next_research_direction": {"type": "string"},
+        "keywords": {"type": "array", "items": {"type": "string"}},
+        "methods": {"type": "array", "items": {"type": "string"}},
+        "diseases": {"type": "array", "items": {"type": "string"}},
+        "populations": {"type": "array", "items": {"type": "string"}},
+        "data_types": {"type": "array", "items": {"type": "string"}},
+        "supporting_paper_ids": {"type": "array", "items": {"type": "string"}},
+        "quality_score": {"type": "number"},
+        "quality_notes": {"type": "string"},
+    },
+    "required": [
+        "cluster_id", "name", "summary", "core_question",
+        "scientific_rationale", "next_research_direction", "keywords",
+        "methods", "diseases", "populations", "data_types",
+        "supporting_paper_ids", "quality_score", "quality_notes",
+    ],
+    "additionalProperties": False,
+}
+
+
+CLUSTER_THEMES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "themes": {
+            "type": "array", "minItems": 3, "maxItems": 3,
+            "items": CLUSTER_THEME_ITEM,
+        }
+    },
+    "required": ["themes"],
+    "additionalProperties": False,
+}
+
+
 def rerank_opportunities(api_key, theme, opportunities, model="gpt-4o-mini"):
     """Scientifically rerank one theme's shortlisted opportunities in one call."""
     if not opportunities:
@@ -196,8 +364,9 @@ def _paper_relevance(theme, paper):
 
 def build_profiles_with_openai(conn, researcher_id, api_key,
                                model="gpt-4o-mini", seed_keywords=None,
-                               max_themes=3):
-    """Generate and store three validated themes from imported publications."""
+                               max_themes=3,
+                               embedding_model="text-embedding-3-small"):
+    """Cluster papers first, then generate and quality-review three themes."""
     if max_themes != 3:
         raise ValueError("The OpenAI theme generator currently requires three themes")
     researcher = conn.execute(
@@ -222,83 +391,133 @@ def build_profiles_with_openai(conn, researcher_id, api_key,
         "publication_date": row["publication_date"] or "",
         "journal": row["journal"] or "",
     } for row in rows]
+    paper_texts = [
+        f"Title: {paper['title']}\nAbstract: {paper['abstract']}\n"
+        f"Journal: {paper['journal']}\nYear: {paper['publication_date']}"
+        for paper in papers
+    ]
+    seed_texts = []
+    if seed_keywords:
+        seed_texts = [", ".join(_clean_list(group)) or f"research theme {index}"
+                      for index, group in enumerate(seed_keywords[:3], start=1)]
+        seed_texts += [f"research theme {index}"
+                       for index in range(len(seed_texts) + 1, 4)]
+    vectors = embed_texts(api_key, paper_texts + seed_texts, model=embedding_model)
+    paper_vectors = vectors[:len(papers)]
+    clusters = cluster_papers(
+        paper_vectors,
+        seed_vectors=vectors[len(papers):] if seed_texts else None,
+        k=3,
+    )
+
     researcher_payload = {
         "name": researcher["name"],
         "title": researcher["title"],
         "career_stage": researcher["career_stage"],
         "country": researcher["country"],
     }
-    guidance = (
-        "Generate three distinct themes directly from the publication evidence."
-        if not seed_keywords else
-        "Generate exactly one theme for each keyword group, preserving the group order: "
-        + json.dumps(seed_keywords, ensure_ascii=False)
-    )
-    prompt = f"""
-Build a precise scientific funding profile from a researcher's publications.
+    cluster_payload = []
+    for cluster_index, cluster in enumerate(clusters, start=1):
+        cluster_payload.append({
+            "cluster_id": cluster_index,
+            "keyword_guidance": seed_texts[cluster_index - 1] if seed_texts else "",
+            "coherence_score": round(100 * cluster["coherence"], 1),
+            "separation_score": round(100 * cluster["separation"], 1),
+            "stability_score": round(100 * cluster["stability"], 1),
+            "papers": [papers[index] for index in cluster["indices"]],
+            "excluded_outlier_paper_ids": [papers[index]["paper_id"]
+                                           for index in cluster["outlier_indices"]],
+        })
+
+    generation_prompt = f"""
+Build three precise, research-worthy themes from precomputed semantic paper clusters.
 
 RESEARCHER:
 {json.dumps(researcher_payload, ensure_ascii=False)}
 
-PUBLICATIONS:
-{json.dumps(papers, ensure_ascii=False)}
+PAPER CLUSTERS:
+{json.dumps(cluster_payload, ensure_ascii=False)}
 
 INSTRUCTIONS:
-- {guidance}
-- Return exactly three themes.
-- Make the themes scientifically specific and useful for funding searches.
-- Minimize conceptual and keyword overlap among themes.
+- Return exactly one theme for each cluster_id, preserving cluster order.
+- Do not move a paper between clusters and do not use excluded outlier papers.
+- Formulate a coherent scientific question, not merely a list of shared terms.
+- The theme should connect a problem or mechanism, a method or evidence type,
+  and a disease/population when supported.
+- Propose a plausible next research direction that follows from the papers;
+  do not claim unpublished results.
+- Make themes specific, distinct, and useful for funding searches.
 - Keywords should normally be specific 2-6 word scientific phrases, such as
   "transcriptome-wide association studies" or "electronic health records".
 - Avoid isolated generic tokens such as "use", "study", "analysis", "health",
   "learning", "model", or "prediction".
 - Distinguish research topics from methods, diseases, populations, and data types.
-- Use only information supported by the supplied publications and keyword groups.
-- Every supporting_paper_id must exactly match a supplied paper_id.
-- Assign each paper to at most one theme; do not repeat supporting paper IDs.
-- Include the strongest supporting papers for each theme.
-- Summaries should be concise complete sentences, not keyword fragments.
+- Use only evidence in that cluster and its optional keyword guidance.
+- supporting_paper_ids may contain only paper IDs from the same cluster.
+- quality_score is a preliminary 0-100 assessment of coherence, specificity,
+  research question clarity, evidence, next-step logic, funding relevance,
+  and distinctiveness.
 """
-    parsed = _structured_chat(
+    draft = _structured_chat(
         api_key, model, [
             {"role": "system", "content": (
                 "You are a conservative scientific research analyst. "
                 "Return only evidence-grounded structured data."
             )},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": generation_prompt},
         ],
-        THEME_SCHEMA, "research_themes")
+        CLUSTER_THEMES_SCHEMA, "clustered_research_themes")
+
+    review_prompt = f"""
+Audit and, when needed, revise these draft research themes.
+
+RESEARCHER:
+{json.dumps(researcher_payload, ensure_ascii=False)}
+
+FIXED PAPER CLUSTERS:
+{json.dumps(cluster_payload, ensure_ascii=False)}
+
+DRAFT THEMES:
+{json.dumps(draft, ensure_ascii=False)}
+
+For every theme, review: internal coherence, scientific specificity, clarity
+of the research question, strength of paper evidence, logic of the proposed
+next direction, funding relevance, and distinctiveness from the other themes.
+Revise vague or list-like themes. Preserve cluster_id and never move papers
+between clusters. Give a conservative final quality_score from 0 to 100 and
+brief quality_notes naming any remaining limitation.
+"""
+    parsed = _structured_chat(
+        api_key, model, [
+            {"role": "system", "content": (
+                "You are a rigorous scientific program reviewer. Return only "
+                "evidence-grounded structured data."
+            )},
+            {"role": "user", "content": review_prompt},
+        ], CLUSTER_THEMES_SCHEMA, "reviewed_research_themes")
     themes = parsed.get("themes") or []
     if len(themes) != 3:
         raise ValueError(f"OpenAI returned {len(themes)} themes instead of 3")
 
-    allowed_ids = {paper["paper_id"] for paper in papers}
-    paper_by_id = {paper["paper_id"]: paper for paper in papers}
-    used_ids = set()
+    themes_by_cluster = {int(theme.get("cluster_id", 0)): theme for theme in themes}
     validated = []
-    for index, theme in enumerate(themes, start=1):
+    for index, cluster in enumerate(clusters, start=1):
+        theme = themes_by_cluster.get(index)
+        if not theme:
+            raise ValueError(f"OpenAI omitted paper cluster {index}")
         name = " ".join(str(theme.get("name") or "").split()).strip()
         summary = " ".join(str(theme.get("summary") or "").split()).strip()
         if not name or not summary:
             raise ValueError(f"OpenAI theme {index} is missing a name or summary")
-        evidence = []
-        for paper_id in theme.get("supporting_paper_ids") or []:
-            if paper_id in allowed_ids and paper_id not in used_ids:
-                evidence.append(paper_id)
-                used_ids.add(paper_id)
-        if not evidence:
-            unused = [paper for paper in papers if paper["paper_id"] not in used_ids]
-            if unused:
-                best = max(unused, key=lambda paper: _paper_relevance(theme, paper))
-                evidence = [best["paper_id"]]
-                used_ids.add(best["paper_id"])
-        if not evidence:
-            raise ValueError(f"OpenAI theme {index} has no available supporting paper")
-        # Put the strongest valid evidence first even when the model supplied IDs.
-        evidence.sort(
-            key=lambda paper_id: _paper_relevance(theme, paper_by_id[paper_id]),
-            reverse=True,
-        )
+        evidence = [papers[paper_index]["paper_id"]
+                    for paper_index in cluster["indices"]]
+        evidence_scores = {
+            papers[paper_index]["paper_id"]: round(
+                100 * cluster["similarities"][paper_index], 1)
+            for paper_index in cluster["indices"]
+        }
+        quality_score = max(0.0, min(100.0, float(
+            theme.get("quality_score") or 0)))
         validated.append({
             "name": name,
             "summary": summary,
@@ -307,7 +526,16 @@ INSTRUCTIONS:
             "diseases": _clean_list(theme.get("diseases"), 12),
             "populations": _clean_list(theme.get("populations"), 12),
             "data_types": _clean_list(theme.get("data_types"), 12),
-            "evidence": evidence[:12],
+            "evidence": evidence[:20],
+            "evidence_scores": evidence_scores,
+            "excluded": [papers[paper_index]["paper_id"]
+                         for paper_index in cluster["outlier_indices"]],
+            "coherence_score": round(100 * cluster["coherence"], 1),
+            "separation_score": round(100 * cluster["separation"], 1),
+            "stability_score": round(100 * cluster["stability"], 1),
+            "quality_score": round(quality_score, 1),
+            "quality_notes": " ".join(
+                str(theme.get("quality_notes") or "").split())[:500],
         })
 
     conn.execute(
@@ -329,7 +557,16 @@ INSTRUCTIONS:
             "populations": theme["populations"],
             "data_types": theme["data_types"],
             "evidence_output_ids": theme["evidence"],
-            "confidence": min(0.95, 0.65 + 0.05 * len(theme["evidence"])),
+            "evidence_scores": theme["evidence_scores"],
+            "excluded_output_ids": theme["excluded"],
+            "coherence_score": theme["coherence_score"],
+            "separation_score": theme["separation_score"],
+            "stability_score": theme["stability_score"],
+            "quality_score": theme["quality_score"],
+            "quality_notes": theme["quality_notes"],
+            "confidence": round((theme["coherence_score"] +
+                                 theme["stability_score"] +
+                                 theme["quality_score"]) / 300, 3),
             "manually_verified": 0,
             "generated_at": utcnow(),
         }, ["theme_id"])

@@ -112,7 +112,8 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                         conn, "web-form-researcher", openai_api_key,
                         model=openai_model, seed_keywords=seed_keywords,
                         max_themes=3)
-                    theme_source = f"OpenAI {openai_model}"
+                    theme_source = (
+                        f"Semantic paper clustering + OpenAI {openai_model}")
                 except Exception as exc:
                     build_profiles(
                         conn, max_themes=3, seed_keywords=seed_keywords,
@@ -191,16 +192,32 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
         """).fetchall()
         for theme in generated_rows:
             evidence_ids = json.loads(theme["evidence_output_ids"] or "[]")
+            evidence_scores = json.loads(theme["evidence_scores"] or "{}")
+            excluded_ids = json.loads(theme["excluded_output_ids"] or "[]")
             evidence_papers = []
+            excluded_papers = []
             if evidence_ids:
                 placeholders = ",".join("?" for _ in evidence_ids)
                 paper_rows = conn.execute(
                     f"SELECT output_id, title, publication_date FROM research_outputs "
                     f"WHERE output_id IN ({placeholders})", evidence_ids
                 ).fetchall()
-                by_id = {paper["output_id"]: dict(paper) for paper in paper_rows}
+                by_id = {paper["output_id"]: {
+                    **dict(paper),
+                    "theme_similarity": evidence_scores.get(paper["output_id"]),
+                } for paper in paper_rows}
                 evidence_papers = [by_id[output_id] for output_id in evidence_ids
                                    if output_id in by_id]
+            if excluded_ids:
+                placeholders = ",".join("?" for _ in excluded_ids)
+                excluded_rows = conn.execute(
+                    f"SELECT output_id, title, publication_date FROM research_outputs "
+                    f"WHERE output_id IN ({placeholders})", excluded_ids
+                ).fetchall()
+                excluded_by_id = {paper["output_id"]: dict(paper)
+                                  for paper in excluded_rows}
+                excluded_papers = [excluded_by_id[output_id] for output_id in excluded_ids
+                                   if output_id in excluded_by_id]
             generated_themes.append({
                 "name": theme["theme_name"] or "",
                 "summary": theme["summary"] or "",
@@ -210,6 +227,12 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                 "populations": json.loads(theme["populations"] or "[]"),
                 "data_types": json.loads(theme["data_types"] or "[]"),
                 "evidence_papers": evidence_papers,
+                "excluded_papers": excluded_papers,
+                "coherence_score": theme["coherence_score"],
+                "separation_score": theme["separation_score"],
+                "stability_score": theme["stability_score"],
+                "quality_score": theme["quality_score"],
+                "quality_notes": theme["quality_notes"] or "",
                 "generation_source": theme_source,
                 "generation_warning": next(
                     (warning for warning in system_warnings
@@ -221,7 +244,11 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                    m.domain_score, m.evidence_score, m.semantic_score,
                    m.llm_score, m.model_version, m.eligibility_status,
                    m.eligibility_reasons, m.matched_terms, m.explanation,
-                   t.theme_name, o.opportunity_number, o.title, o.agency,
+                   t.theme_name, t.coherence_score AS theme_coherence_score,
+                   t.separation_score AS theme_separation_score,
+                   t.stability_score AS theme_stability_score,
+                   t.quality_score AS theme_quality_score,
+                   o.opportunity_number, o.title, o.agency,
                    o.close_date, o.source_url
             FROM matches m
             JOIN opportunities o USING(opportunity_id)
@@ -236,7 +263,12 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                    tm.domain_score, tm.evidence_score, tm.semantic_score,
                    tm.llm_score, tm.model_version, tm.eligibility_status,
                    tm.eligibility_reasons, tm.matched_terms, tm.explanation,
-                   t.theme_name, t.theme_id, o.opportunity_number, o.title,
+                   t.theme_name, t.theme_id,
+                   t.coherence_score AS theme_coherence_score,
+                   t.separation_score AS theme_separation_score,
+                   t.stability_score AS theme_stability_score,
+                   t.quality_score AS theme_quality_score,
+                   o.opportunity_number, o.title,
                    o.agency, o.close_date, o.source_url
             FROM theme_matches tm
             JOIN opportunities o USING(opportunity_id)
@@ -588,13 +620,37 @@ with st.container(border=True):
             with st.expander(f"Theme {index}: {theme.get('name', '')}", expanded=True):
                 st.write(theme.get("summary", ""))
                 st.write("**Keywords:** " + ", ".join(theme.get("keywords", [])))
+                metric_values = [
+                    ("Paper coherence", theme.get("coherence_score")),
+                    ("Theme separation", theme.get("separation_score")),
+                    ("Cluster stability", theme.get("stability_score")),
+                    ("Theme quality", theme.get("quality_score")),
+                ]
+                available_metrics = [(label, value) for label, value in metric_values
+                                     if value is not None]
+                if available_metrics:
+                    metric_columns = st.columns(len(available_metrics))
+                    for metric_column, (label, value) in zip(
+                            metric_columns, available_metrics):
+                        metric_column.metric(label, f"{float(value):.1f}/100")
+                if theme.get("quality_notes"):
+                    st.caption("Quality review: " + theme["quality_notes"])
                 papers = theme.get("evidence_papers", [])
                 st.markdown("**Scopus papers supporting this theme**")
                 for paper in papers:
                     date = paper.get("publication_date") or "date unavailable"
-                    st.markdown(f"- {paper.get('title', 'Untitled')} ({date})")
+                    similarity = paper.get("theme_similarity")
+                    similarity_text = (f" · similarity {float(similarity):.1f}/100"
+                                       if similarity is not None else "")
+                    st.markdown(
+                        f"- {paper.get('title', 'Untitled')} ({date}){similarity_text}")
                 if not papers:
                     st.caption("No individual evidence paper was recorded for this theme.")
+                excluded_papers = theme.get("excluded_papers", [])
+                if excluded_papers:
+                    st.caption(
+                        "Excluded as weak semantic outliers: " + "; ".join(
+                            paper.get("title", "Untitled") for paper in excluded_papers))
     else:
         st.caption("The three generated themes and their supporting papers will appear here.")
 
