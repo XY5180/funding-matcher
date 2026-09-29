@@ -1,4 +1,4 @@
-# Funding Matcher
+# Funding Match System
 
 Runnable backend prototype for:
 
@@ -15,6 +15,7 @@ from environment variables and are never written to the database.
 ## Quick start
 
 ```bash
+cd funding_match_system
 python run_pipeline.py demo --reset
 ```
 
@@ -85,7 +86,10 @@ themes automatically.
 
 After a researcher is matched, the three generated themes are shown for
 review. Each generated theme also lists the Scopus publication title(s)
-recorded as evidence for that theme.
+recorded as evidence for that theme. The generated theme table can be
+downloaded as CSV, including structured theme fields, supporting and excluded
+papers, paper-to-theme similarities, quality diagnostics, and generation
+source.
 
 The web workflow offers three theme modes. **Generate themes automatically from
 Scopus** builds three themes from imported paper titles and abstracts.
@@ -93,7 +97,7 @@ Scopus** builds three themes from imported paper titles and abstracts.
 groups and generates one theme per group. **Enter themes manually** skips
 Scopus theme generation and matches the entered themes directly.
 
-When `OPENAI_API_KEY` is configured, the first two modes can use `gpt-4o-mini`
+When `OPENAI_API_KEY` is configured, the first two modes can use `gpt-6-astra`
 to produce evidence-grounded structured themes. Paper title/abstract
 embeddings are clustered before the model sees them, so the model names and
 explains fixed semantic paper groups rather than choosing papers freely.
@@ -107,8 +111,8 @@ within-theme paper coherence, separation from the other themes, clustering
 stability, and final LLM-reviewed theme quality. Supporting papers cannot be
 moved between clusters by the language model.
 
-All three modes can also use `text-embedding-3-small` semantic similarity and
-`gpt-4o-mini` funding reranking. The local transparent algorithm remains
+All three modes can also use `text-embedding-3-large` semantic similarity and
+`gpt-6-astra` funding reranking. The local transparent algorithm remains
 available and is used automatically if an OpenAI request fails. OpenAI is
 called through HTTPS directly, so the deployment does not depend on a
 particular version of the OpenAI Python package.
@@ -160,7 +164,8 @@ App settings → Secrets:
 SCOPUS_API_KEY = "..."
 SIMPLER_GRANTS_API_KEY = "..."
 OPENAI_API_KEY = "..."
-OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_MODEL = "gpt-6-astra"
+OPENAI_EMBEDDING_MODEL = "text-embedding-3-large"
 ```
 
 The command-line version can export the Top 5 opportunities for every theme:

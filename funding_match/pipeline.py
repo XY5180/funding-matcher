@@ -796,8 +796,8 @@ def _candidate_opportunities(conn, theme, all_opportunities):
             if opportunity["opportunity_id"] in candidate_ids]
 
 
-def match_all(conn, openai_api_key="", openai_model="gpt-4o-mini",
-              embedding_model="text-embedding-3-small", warnings=None):
+def match_all(conn, openai_api_key="", openai_model="gpt-6-astra",
+              embedding_model="text-embedding-3-large", warnings=None):
     themes = conn.execute("SELECT * FROM research_themes").fetchall()
     opportunities = conn.execute("SELECT * FROM opportunities WHERE status IN ('posted','forecasted') OR status IS NULL").fetchall()
     researchers = {r["researcher_id"]: r for r in conn.execute("SELECT * FROM researchers")}

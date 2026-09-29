@@ -27,7 +27,8 @@ def main():
         f"SCOPUS_API_KEY={scopus}\n"
         f"SIMPLER_GRANTS_API_KEY={simpler}\n"
         f"OPENAI_API_KEY={openai}\n"
-        "OPENAI_MODEL=gpt-4o-mini\n"
+        "OPENAI_MODEL=gpt-6-astra\n"
+        "OPENAI_EMBEDDING_MODEL=text-embedding-3-large\n"
         "SCOPUS_INST_TOKEN=\n"
     )
     TARGET.write_text(content, encoding="utf-8")

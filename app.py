@@ -49,7 +49,8 @@ def server_setting(name, default=""):
 def run_match(profile, themes, use_scopus=False, max_publications=20,
               use_live_grants=False, funding_query="", seed_keywords=None,
               scopus_api_key="", simpler_grants_api_key="", use_llm=False,
-              openai_api_key="", openai_model="gpt-4o-mini"):
+              openai_api_key="", openai_model="gpt-6-astra",
+              openai_embedding_model="text-embedding-3-large"):
     """Run one isolated match without changing the command-line database."""
     with tempfile.TemporaryDirectory(prefix="funding-match-") as tmp:
         run_config = request_config(scopus_api_key, simpler_grants_api_key)
@@ -111,7 +112,8 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                     build_profiles_with_openai(
                         conn, "web-form-researcher", openai_api_key,
                         model=openai_model, seed_keywords=seed_keywords,
-                        max_themes=3)
+                        max_themes=3,
+                        embedding_model=openai_embedding_model)
                     theme_source = (
                         f"Semantic paper clustering + OpenAI {openai_model}")
                 except Exception as exc:
@@ -180,6 +182,7 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
             conn,
             openai_api_key=openai_api_key if use_llm else "",
             openai_model=openai_model,
+            embedding_model=openai_embedding_model,
             warnings=system_warnings,
         )
         warning_message = " ".join(system_warnings) or None
@@ -560,7 +563,9 @@ scopus_api_key = (scopus_key_input.strip()
 simpler_grants_api_key = (grants_key_input.strip()
                           or server_setting("SIMPLER_GRANTS_API_KEY"))
 openai_api_key = openai_key_input.strip() or server_setting("OPENAI_API_KEY")
-openai_model = server_setting("OPENAI_MODEL", "gpt-4o-mini")
+openai_model = server_setting("OPENAI_MODEL", "gpt-6-astra")
+openai_embedding_model = server_setting(
+    "OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
 
 profile_mode = st.radio(
     "Profile mode",
@@ -898,7 +903,8 @@ if submitted:
                     simpler_grants_api_key=simpler_grants_api_key,
                     use_llm=use_llm,
                     openai_api_key=openai_api_key,
-                    openai_model=openai_model)
+                    openai_model=openai_model,
+                    openai_embedding_model=openai_embedding_model)
             st.session_state["match_results"] = (
                 opportunity_rows, theme_rows, snapshot_date, top_k, minimum_fit,
                 imported_count, resolved_author_id, opportunity_count,

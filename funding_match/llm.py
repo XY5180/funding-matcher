@@ -67,20 +67,24 @@ def _post_openai(path, api_key, payload, timeout=90):
 
 
 def _structured_chat(api_key, model, messages, schema, name):
-    payload = _post_openai("chat/completions", api_key, {
+    request = {
         "model": model,
         "messages": messages,
-        "temperature": 0.1,
         "response_format": {
             "type": "json_schema",
             "json_schema": {"name": name, "strict": True, "schema": schema},
         },
-    })
+    }
+    if model.startswith("gpt-6"):
+        request["reasoning_effort"] = "medium"
+    else:
+        request["temperature"] = 0.1
+    payload = _post_openai("chat/completions", api_key, request)
     content = payload["choices"][0]["message"]["content"]
     return json.loads(content)
 
 
-def embed_texts(api_key, texts, model="text-embedding-3-small"):
+def embed_texts(api_key, texts, model="text-embedding-3-large"):
     """Return normalized OpenAI embeddings for non-empty texts."""
     cleaned = [" ".join(str(text).split())[:12000] or "empty" for text in texts]
     payload = _post_openai("embeddings", api_key, {
@@ -311,7 +315,7 @@ CLUSTER_THEMES_SCHEMA = {
 }
 
 
-def rerank_opportunities(api_key, theme, opportunities, model="gpt-4o-mini"):
+def rerank_opportunities(api_key, theme, opportunities, model="gpt-6-astra"):
     """Scientifically rerank one theme's shortlisted opportunities in one call."""
     if not opportunities:
         return {}
@@ -417,9 +421,9 @@ def _paper_relevance(theme, paper):
 
 
 def build_profiles_with_openai(conn, researcher_id, api_key,
-                               model="gpt-4o-mini", seed_keywords=None,
+                               model="gpt-6-astra", seed_keywords=None,
                                max_themes=3,
-                               embedding_model="text-embedding-3-small"):
+                               embedding_model="text-embedding-3-large"):
     """Cluster papers first, then generate and quality-review three themes."""
     if max_themes != 3:
         raise ValueError("The OpenAI theme generator currently requires three themes")
