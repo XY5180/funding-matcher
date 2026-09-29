@@ -574,8 +574,54 @@ def weighted_fit(theme, opp, idf):
     if method is not None: parts.append((0.15,method))
     if domain is not None: parts.append((0.10,domain))
     score = sum(w*s for w,s in parts)/sum(w for w,_ in parts)
-    shared = sorted(set(ta)&set(ob), key=lambda t: -ta[t]*ob[t]*idf.get(t,1)**2)[:12]
+    shared = matched_keyphrases(theme, opp, ta, ob, idf)
     return 100*score, 100*topic, None if method is None else 100*method, None if domain is None else 100*domain, 100*evidence, shared
+
+
+def matched_keyphrases(theme, opp, theme_terms, opportunity_terms, idf, limit=10):
+    """Return readable shared scientific concepts without changing the fit score."""
+    opportunity_text = " ".join(
+        str(opp[key] or "") for key in ("title", "description", "funding_categories")
+    ).lower()
+    candidates = []
+    for key in ("keywords", "methods", "diseases", "populations", "data_types"):
+        candidates.extend(decode_list(theme[key]))
+    candidates.insert(0, str(theme["theme_name"] or ""))
+
+    ranked = []
+    seen = set()
+    for candidate in candidates:
+        phrase = " ".join(terms(str(candidate)))
+        tokens = phrase.split()
+        if not phrase or phrase in seen:
+            continue
+        # Report scientific phrases rather than the isolated tokens used by
+        # the transparent TF-IDF scorer internally.
+        exact = phrase in opportunity_text
+        overlap = set(tokens) & set(opportunity_terms)
+        if exact or (len(tokens) >= 2 and len(overlap) / len(tokens) >= 0.67):
+            if len(tokens) >= 2:
+                score = sum(
+                    theme_terms[token] * opportunity_terms[token] * idf.get(token, 1) ** 2
+                    for token in overlap
+                ) + (5 if exact else 0)
+                ranked.append((score, phrase))
+                seen.add(phrase)
+
+    ranked.sort(reverse=True)
+    selected = []
+    for _, phrase in ranked:
+        phrase_tokens = set(phrase.split())
+        if any(
+            len(phrase_tokens & set(existing.split()))
+            / max(1, min(len(phrase_tokens), len(set(existing.split())))) >= 0.75
+            for existing in selected
+        ):
+            continue
+        selected.append(phrase)
+        if len(selected) >= limit:
+            break
+    return selected
 
 def match_all(conn):
     themes = conn.execute("SELECT * FROM research_themes").fetchall()

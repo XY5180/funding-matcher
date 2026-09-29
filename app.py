@@ -129,6 +129,26 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
 
         funding_warning = None
 
+        # Live grant retrieval uses the generated/entered themes automatically.
+        # Keep the optional argument for command compatibility, but the web UI
+        # no longer requires users to describe the same research twice.
+        if not funding_query:
+            query_parts = []
+            theme_rows_for_query = conn.execute("""
+                SELECT theme_name, keywords FROM research_themes
+                WHERE researcher_id='web-form-researcher'
+                ORDER BY theme_id
+            """).fetchall()
+            for theme_row in theme_rows_for_query:
+                keywords = json.loads(theme_row["keywords"] or "[]")
+                candidates = keywords[:3] or [theme_row["theme_name"]]
+                for candidate in candidates:
+                    candidate = " ".join(str(candidate).split()).strip()
+                    if candidate and candidate.casefold() not in {
+                            part.casefold() for part in query_parts}:
+                        query_parts.append(candidate)
+            funding_query = " ".join(query_parts)[:100]
+
         def load_snapshot():
             snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
             for opportunity in snapshot["opportunities"]:
@@ -573,11 +593,11 @@ with st.container(border=True):
               if grants_ready else
               "Enter a Simpler.Grants.gov API key above or configure Streamlit Secrets."),
     )
-    funding_query = st.text_input(
-        "Funding search terms",
-        "cancer genomics electronic health records medical imaging",
-        disabled=not use_live_grants,
-    )
+    if use_live_grants:
+        st.caption(
+            "Live funding search terms will be generated automatically from "
+            "the three research themes."
+        )
 
     submitted = st.button(
         "Generate themes and find funding" if not manual_theme_mode
@@ -626,7 +646,7 @@ if submitted:
                     use_scopus=use_scopus and not manual_theme_mode,
                     max_publications=max_publications,
                     use_live_grants=use_live_grants,
-                    funding_query=funding_query.strip(),
+                    funding_query="",
                     seed_keywords=seed_keywords if keyword_guided_mode else None,
                     scopus_api_key=scopus_api_key,
                     simpler_grants_api_key=simpler_grants_api_key,
