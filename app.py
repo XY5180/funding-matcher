@@ -13,7 +13,7 @@ from funding_match.clients import utcnow
 from funding_match.db import connect, upsert
 from funding_match.llm import build_profiles_with_openai
 from funding_match.pipeline import (build_profiles, import_scopus_researcher,
-                                    match_all, sync_grants)
+                                    match_all, sync_grants_by_theme)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -129,38 +129,31 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
 
         funding_warning = None
 
-        # Live grant retrieval uses the generated/entered themes automatically.
-        # Keep the optional argument for command compatibility, but the web UI
-        # no longer requires users to describe the same research twice.
-        if not funding_query:
-            query_parts = []
-            theme_rows_for_query = conn.execute("""
-                SELECT theme_name, keywords FROM research_themes
-                WHERE researcher_id='web-form-researcher'
-                ORDER BY theme_id
-            """).fetchall()
-            for theme_row in theme_rows_for_query:
-                keywords = json.loads(theme_row["keywords"] or "[]")
-                candidates = keywords[:3] or [theme_row["theme_name"]]
-                for candidate in candidates:
-                    candidate = " ".join(str(candidate).split()).strip()
-                    if candidate and candidate.casefold() not in {
-                            part.casefold() for part in query_parts}:
-                        query_parts.append(candidate)
-            funding_query = " ".join(query_parts)[:100]
-
         def load_snapshot():
             snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
             for opportunity in snapshot["opportunities"]:
                 upsert(conn, "opportunities", opportunity, ["opportunity_id"])
+            themes_for_snapshot = conn.execute("""
+                SELECT theme_id FROM research_themes
+                WHERE researcher_id='web-form-researcher'
+            """).fetchall()
+            for theme_row in themes_for_snapshot:
+                for opportunity in snapshot["opportunities"]:
+                    upsert(conn, "theme_opportunity_candidates", {
+                        "researcher_id": "web-form-researcher",
+                        "theme_id": theme_row["theme_id"],
+                        "opportunity_id": opportunity["opportunity_id"],
+                        "query_text": "included snapshot",
+                        "retrieved_at": utcnow(),
+                    }, ["researcher_id", "theme_id", "opportunity_id"])
             return (len(snapshot["opportunities"]),
                     f"Snapshot {snapshot['snapshot_date']}")
 
         if use_live_grants:
             try:
-                opportunity_count = sync_grants(
-                    conn, run_config, funding_query,
-                    api_key=simpler_grants_api_key)
+                opportunity_count = sync_grants_by_theme(
+                    conn, run_config, "web-form-researcher",
+                    api_key=simpler_grants_api_key, max_per_theme=50)
                 if not opportunity_count:
                     raise ValueError(
                         "Simpler.Grants.gov returned no opportunities for this query")
@@ -182,7 +175,13 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
             system_warnings.append(funding_warning)
         warning_message = " ".join(system_warnings) or None
         conn.commit()
-        match_all(conn)
+        match_all(
+            conn,
+            openai_api_key=openai_api_key if use_llm else "",
+            openai_model=openai_model,
+            warnings=system_warnings,
+        )
+        warning_message = " ".join(system_warnings) or None
 
         generated_themes = []
         generated_rows = conn.execute("""
@@ -218,7 +217,9 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
             })
 
         opportunity_rows = conn.execute("""
-            SELECT m.scientific_fit, m.eligibility_status,
+            SELECT m.scientific_fit, m.topic_score, m.method_score,
+                   m.domain_score, m.evidence_score, m.semantic_score,
+                   m.llm_score, m.model_version, m.eligibility_status,
                    m.eligibility_reasons, m.matched_terms, m.explanation,
                    t.theme_name, o.opportunity_number, o.title, o.agency,
                    o.close_date, o.source_url
@@ -231,7 +232,9 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                      m.scientific_fit DESC
         """).fetchall()
         theme_rows = conn.execute("""
-            SELECT tm.scientific_fit, tm.eligibility_status,
+            SELECT tm.scientific_fit, tm.topic_score, tm.method_score,
+                   tm.domain_score, tm.evidence_score, tm.semantic_score,
+                   tm.llm_score, tm.model_version, tm.eligibility_status,
                    tm.eligibility_reasons, tm.matched_terms, tm.explanation,
                    t.theme_name, t.theme_id, o.opportunity_number, o.title,
                    o.agency, o.close_date, o.source_url
@@ -250,11 +253,28 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                 warning_message, generated_themes, theme_source)
 
 
+def render_score_details(row):
+    parts = []
+    labels = [
+        ("Topic", "topic_score"), ("Semantic", "semantic_score"),
+        ("LLM review", "llm_score"), ("Method", "method_score"),
+        ("Domain", "domain_score"), ("Paper evidence", "evidence_score"),
+    ]
+    for label, key in labels:
+        value = row.get(key)
+        if value is not None:
+            parts.append(f"{label} {float(value):.1f}")
+    if parts:
+        st.caption("Score components: " + " · ".join(parts))
+    if row.get("explanation"):
+        st.write("**Why this match:** " + row["explanation"])
+
+
 def render_results(rows, snapshot_date):
     st.subheader("Ranked funding matches")
     st.caption(
-        f"Funding source: {snapshot_date}. Scientific fit is a transparent "
-        "text-similarity baseline, not an application-success probability."
+        f"Funding source: {snapshot_date}. Scientific fit measures research "
+        "alignment and is not an application-success probability."
     )
     for rank, row in enumerate(rows, start=1):
         reasons = json.loads(row["eligibility_reasons"] or "[]")
@@ -274,6 +294,7 @@ def render_results(rows, snapshot_date):
                 st.info("Human review: " + "; ".join(reasons))
             st.write(f"**Best matching theme:** {row['theme_name']}")
             st.write("**Matched terms:** " + (", ".join(matched) or "None"))
+            render_score_details(row)
             st.link_button("Open official announcement", row["source_url"])
 
     export_rows = []
@@ -300,8 +321,8 @@ def render_results(rows, snapshot_date):
 def render_theme_results(rows, top_k, minimum_fit):
     st.subheader("Top funding matches by research theme")
     st.caption(
-        "Each theme is scored against every opportunity. Results below are "
-        "ranked independently within each theme."
+        "Each theme has its own candidate search and ranking. Semantic and LLM "
+        "scores appear when OpenAI is enabled."
     )
     themes = []
     for row in rows:
@@ -336,6 +357,7 @@ def render_theme_results(rows, top_k, minimum_fit):
                 if reasons:
                     st.info("Human review: " + "; ".join(reasons))
                 st.write("**Matched terms:** " + (", ".join(matched) or "None"))
+                render_score_details(row)
                 st.link_button("Open official announcement", row["source_url"],
                                key=f"theme-link-{row['theme_id']}-{row['opportunity_number']}")
 
@@ -504,25 +526,24 @@ with st.container(border=True):
         )
 
     openai_ready = bool(openai_api_key)
-    if manual_theme_mode:
-        use_llm = False
-    else:
-        use_llm = st.checkbox(
-            "Use OpenAI to improve theme generation",
-            value=openai_ready,
-            disabled=not openai_ready,
-            key=f"use-openai-{mode_key}",
-            help=(
-                f"Uses {openai_model} and falls back to the local algorithm if needed."
-                if openai_ready else
-                "Enter an OpenAI API key above or configure Streamlit Secrets."
-            ),
+    use_llm = st.checkbox(
+        ("Use OpenAI for semantic funding matching" if manual_theme_mode else
+         "Use OpenAI for theme generation and semantic funding matching"),
+        value=openai_ready,
+        disabled=not openai_ready,
+        key=f"use-openai-{mode_key}",
+        help=(
+            f"Uses {openai_model} plus text embeddings and falls back to the "
+            "transparent local matcher if needed."
+            if openai_ready else
+            "Enter an OpenAI API key above or configure Streamlit Secrets."
+        ),
+    )
+    if not openai_ready:
+        st.caption(
+            "Add an OpenAI API key to enable semantic matching; the local "
+            "matcher remains available."
         )
-        if not openai_ready:
-            st.caption(
-                "Add an OpenAI API key to enable AI-enhanced themes; "
-                "local generation remains available."
-            )
 
     st.subheader("3. Research themes")
     entered_themes = []

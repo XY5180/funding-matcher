@@ -43,18 +43,24 @@ CREATE TABLE IF NOT EXISTS opportunities(
   expected_awards INTEGER, clinical_trial TEXT, animal_required TEXT,
   career_stages TEXT, countries TEXT, institution_types TEXT,
   other_eligibility TEXT, source_url TEXT, source_updated_at TEXT, raw_json TEXT);
+CREATE TABLE IF NOT EXISTS theme_opportunity_candidates(
+  researcher_id TEXT, theme_id TEXT, opportunity_id TEXT, query_text TEXT,
+  retrieved_at TEXT,
+  PRIMARY KEY(researcher_id, theme_id, opportunity_id));
 CREATE TABLE IF NOT EXISTS matches(
   researcher_id TEXT, opportunity_id TEXT, theme_id TEXT,
   eligibility_status TEXT, eligibility_reasons TEXT,
   scientific_fit REAL, topic_score REAL, method_score REAL,
-  domain_score REAL, evidence_score REAL, matched_terms TEXT,
+  domain_score REAL, evidence_score REAL, semantic_score REAL, llm_score REAL,
+  matched_terms TEXT,
   explanation TEXT, model_version TEXT, scored_at TEXT,
   PRIMARY KEY(researcher_id, opportunity_id));
 CREATE TABLE IF NOT EXISTS theme_matches(
   researcher_id TEXT, opportunity_id TEXT, theme_id TEXT,
   eligibility_status TEXT, eligibility_reasons TEXT,
   scientific_fit REAL, topic_score REAL, method_score REAL,
-  domain_score REAL, evidence_score REAL, matched_terms TEXT,
+  domain_score REAL, evidence_score REAL, semantic_score REAL, llm_score REAL,
+  matched_terms TEXT,
   explanation TEXT, model_version TEXT, scored_at TEXT,
   PRIMARY KEY(researcher_id, opportunity_id, theme_id));
 CREATE TABLE IF NOT EXISTS match_feedback(
@@ -71,6 +77,12 @@ def connect(path):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    for table in ("matches", "theme_matches"):
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column in ("semantic_score", "llm_score"):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} REAL")
+    conn.commit()
     return conn
 
 def upsert(conn, table, row, conflict):

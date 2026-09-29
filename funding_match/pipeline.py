@@ -3,12 +3,14 @@ import hashlib
 import json
 import math
 import re
+import time
 from collections import Counter, defaultdict
 from datetime import date
 from pathlib import Path
 
 from .clients import PureClient, ScopusClient, SimplerGrantsClient, utcnow
 from .db import upsert
+from .llm import embed_texts, rerank_opportunities
 
 STOP = set("""a an and are as at be been by can for from has have in into is it may
 of on or our study studies that the their this to using was were will with research
@@ -307,6 +309,54 @@ def sync_grants(conn, config, query="", api_key=""):
     conn.commit()
     return n
 
+
+def theme_search_query(theme, keyword_limit=5):
+    """Build one concise live-search query for one research theme."""
+    phrases = [str(theme["theme_name"] or "").strip()]
+    phrases.extend(decode_list(theme["keywords"])[:keyword_limit])
+    selected = []
+    for phrase in phrases:
+        phrase = " ".join(phrase.split())
+        if phrase and phrase.casefold() not in {item.casefold() for item in selected}:
+            selected.append(phrase)
+    return " ".join(selected)[:100]
+
+
+def sync_grants_by_theme(conn, config, researcher_id, api_key="",
+                         max_per_theme=50):
+    """Retrieve a separate candidate pool for every research theme."""
+    themes = conn.execute(
+        "SELECT * FROM research_themes WHERE researcher_id=? ORDER BY theme_id",
+        (researcher_id,),
+    ).fetchall()
+    conn.execute(
+        "DELETE FROM theme_opportunity_candidates WHERE researcher_id=?",
+        (researcher_id,),
+    )
+    unique_opportunities = set()
+    for theme in themes:
+        query = theme_search_query(theme)
+        written = 0
+        for raw in SimplerGrantsClient(config, api_key=api_key).opportunities(query):
+            row = normalize_grant(raw)
+            if not row["opportunity_id"]:
+                continue
+            upsert(conn, "opportunities", row, ["opportunity_id"])
+            upsert(conn, "theme_opportunity_candidates", {
+                "researcher_id": researcher_id,
+                "theme_id": theme["theme_id"],
+                "opportunity_id": row["opportunity_id"],
+                "query_text": query,
+                "retrieved_at": utcnow(),
+            }, ["researcher_id", "theme_id", "opportunity_id"])
+            unique_opportunities.add(row["opportunity_id"])
+            written += 1
+            if written >= max_per_theme:
+                break
+        time.sleep(1.05)
+    conn.commit()
+    return len(unique_opportunities)
+
 def terms(text):
     return [t for t in re.findall(r"[a-z][a-z0-9-]+", (text or "").lower())
             if len(t) > 2 and t not in STOP]
@@ -559,7 +609,7 @@ def cosine(a, b, idf):
     nb = math.sqrt(sum(v*v*idf.get(t,1)**2 for t,v in b.items()))
     return dot/(na*nb) if na and nb else 0.0
 
-def weighted_fit(theme, opp, idf):
+def weighted_fit(theme, opp, idf, semantic=None, llm=None):
     ttext = " ".join(str(theme[k] or "") for k in ("theme_name","summary","keywords","methods","diseases","populations","data_types"))
     otext = " ".join(str(opp[k] or "") for k in ("title","description","funding_categories"))
     ta, ob = Counter(terms(ttext)), Counter(terms(otext))
@@ -570,12 +620,24 @@ def weighted_fit(theme, opp, idf):
     method = len(method_terms & opp_terms)/len(method_terms) if method_terms else None
     domain = len(domain_terms & opp_terms)/len(domain_terms) if domain_terms else None
     evidence = min(1.0, len(decode_list(theme["evidence_output_ids"]))/5)
-    parts = [(0.45,topic),(0.20,topic),(0.10,evidence)]
-    if method is not None: parts.append((0.15,method))
-    if domain is not None: parts.append((0.10,domain))
+    if semantic is None:
+        parts = [(0.45,topic),(0.20,topic),(0.10,evidence)]
+        if method is not None: parts.append((0.15,method))
+        if domain is not None: parts.append((0.10,domain))
+    else:
+        # Semantic similarity carries most of the scientific signal. The
+        # lexical score remains visible and reproducible, while the LLM (when
+        # available) checks scientific and funding-mechanism alignment.
+        parts = [(0.25, topic), (0.45, semantic), (0.05, evidence)]
+        if llm is not None: parts.append((0.20, llm))
+        if method is not None: parts.append((0.03, method))
+        if domain is not None: parts.append((0.02, domain))
     score = sum(w*s for w,s in parts)/sum(w for w,_ in parts)
     shared = matched_keyphrases(theme, opp, ta, ob, idf)
-    return 100*score, 100*topic, None if method is None else 100*method, None if domain is None else 100*domain, 100*evidence, shared
+    return (100*score, 100*topic, None if method is None else 100*method,
+            None if domain is None else 100*domain, 100*evidence,
+            None if semantic is None else 100*semantic,
+            None if llm is None else 100*llm, shared)
 
 
 def matched_keyphrases(theme, opp, theme_terms, opportunity_terms, idf, limit=10):
@@ -623,21 +685,113 @@ def matched_keyphrases(theme, opp, theme_terms, opportunity_terms, idf, limit=10
             break
     return selected
 
-def match_all(conn):
+def _theme_text(theme):
+    return " ".join(str(theme[key] or "") for key in (
+        "theme_name", "summary", "keywords", "methods", "diseases",
+        "populations", "data_types"))
+
+
+def _opportunity_text(opportunity):
+    return " ".join(str(opportunity[key] or "") for key in (
+        "title", "description", "funding_categories", "funding_instruments"))
+
+
+def _candidate_opportunities(conn, theme, all_opportunities):
+    candidate_ids = {row[0] for row in conn.execute("""
+        SELECT opportunity_id FROM theme_opportunity_candidates
+        WHERE researcher_id=? AND theme_id=?
+    """, (theme["researcher_id"], theme["theme_id"]))}
+    if not candidate_ids:
+        return all_opportunities
+    return [opportunity for opportunity in all_opportunities
+            if opportunity["opportunity_id"] in candidate_ids]
+
+
+def match_all(conn, openai_api_key="", openai_model="gpt-4o-mini",
+              embedding_model="text-embedding-3-small", warnings=None):
     themes = conn.execute("SELECT * FROM research_themes").fetchall()
     opportunities = conn.execute("SELECT * FROM opportunities WHERE status IN ('posted','forecasted') OR status IS NULL").fetchall()
     researchers = {r["researcher_id"]: r for r in conn.execute("SELECT * FROM researchers")}
     docs = [Counter(terms(" ".join(str(x) for x in row if x))) for row in themes + opportunities]
     df = Counter(t for doc in docs for t in doc)
     idf = {t: math.log((1+len(docs))/(1+n))+1 for t,n in df.items()}
+    semantic = {}
+    llm_reviews = {}
+    if openai_api_key and themes and opportunities:
+        try:
+            theme_keys = [(theme["researcher_id"], theme["theme_id"])
+                          for theme in themes]
+            opportunity_by_id = {item["opportunity_id"]: item for item in opportunities}
+            opportunity_ids = list(opportunity_by_id)
+            texts = [_theme_text(theme) for theme in themes]
+            texts.extend(_opportunity_text(opportunity_by_id[oid]) for oid in opportunity_ids)
+            vectors = []
+            for start in range(0, len(texts), 64):
+                vectors.extend(embed_texts(
+                    openai_api_key, texts[start:start + 64], model=embedding_model))
+            theme_vectors = dict(zip(theme_keys, vectors[:len(themes)]))
+            opportunity_vectors = dict(zip(opportunity_ids, vectors[len(themes):]))
+            for theme in themes:
+                key = (theme["researcher_id"], theme["theme_id"])
+                for opportunity in _candidate_opportunities(conn, theme, opportunities):
+                    raw_cosine = sum(
+                        left * right for left, right in
+                        zip(theme_vectors[key], opportunity_vectors[opportunity["opportunity_id"]])
+                    )
+                    semantic[(key[0], key[1], opportunity["opportunity_id"])] = max(
+                        0.0, min(1.0, raw_cosine))
+
+            # Rerank only the strongest preliminary candidates to control cost
+            # and latency. Each theme is handled in a single structured call.
+            for theme in themes:
+                candidates = _candidate_opportunities(conn, theme, opportunities)
+                preliminary = []
+                for opportunity in candidates:
+                    sem = semantic.get((theme["researcher_id"], theme["theme_id"],
+                                        opportunity["opportunity_id"]))
+                    fit = weighted_fit(theme, opportunity, idf, semantic=sem)
+                    preliminary.append((fit[0], opportunity))
+                shortlist = [dict(item) for _, item in sorted(
+                    preliminary, key=lambda pair: pair[0], reverse=True)[:15]]
+                theme_payload = {
+                    "name": theme["theme_name"], "summary": theme["summary"],
+                    "keywords": decode_list(theme["keywords"]),
+                    "methods": decode_list(theme["methods"]),
+                    "diseases": decode_list(theme["diseases"]),
+                    "populations": decode_list(theme["populations"]),
+                    "data_types": decode_list(theme["data_types"]),
+                }
+                reviews = rerank_opportunities(
+                    openai_api_key, theme_payload, shortlist, model=openai_model)
+                for opportunity_id, review in reviews.items():
+                    llm_reviews[(theme["researcher_id"], theme["theme_id"],
+                                 opportunity_id)] = review
+        except Exception as exc:
+            # OpenAI is an enhancement. Preserve a complete transparent result
+            # if embeddings or reranking are temporarily unavailable.
+            semantic = {}
+            llm_reviews = {}
+            if warnings is not None:
+                warnings.append(
+                    "OpenAI semantic funding matching was unavailable, so the "
+                    f"local matcher was used instead ({exc}).")
     best = {}
     conn.execute("DELETE FROM theme_matches")
+    conn.execute("DELETE FROM matches")
     for theme in themes:
         researcher = researchers[theme["researcher_id"]]
-        for opp in opportunities:
-            fit = weighted_fit(theme, opp, idf)
+        for opp in _candidate_opportunities(conn, theme, opportunities):
+            match_key = (theme["researcher_id"], theme["theme_id"],
+                         opp["opportunity_id"])
+            sem = semantic.get(match_key)
+            review = llm_reviews.get(match_key)
+            llm_value = None if review is None else review["score"] / 100
+            fit = weighted_fit(theme, opp, idf, semantic=sem, llm=llm_value)
             status, reasons = eligibility(researcher, opp)
-            score, topic, method, domain, evidence, shared = fit
+            score, topic, method, domain, evidence, semantic_score, llm_score, shared = fit
+            explanation = (review["explanation"] if review else
+                           f"Theme: {theme['theme_name']}. Shared evidence terms: "
+                           f"{', '.join(shared) or 'none'}.")
             pair_row = {
                 "researcher_id": researcher["researcher_id"],
                 "opportunity_id": opp["opportunity_id"],
@@ -649,27 +803,34 @@ def match_all(conn):
                 "method_score": None if method is None else round(method, 1),
                 "domain_score": None if domain is None else round(domain, 1),
                 "evidence_score": round(evidence, 1),
+                "semantic_score": None if semantic_score is None else round(semantic_score, 1),
+                "llm_score": None if llm_score is None else round(llm_score, 1),
                 "matched_terms": shared,
-                "explanation": f"Theme: {theme['theme_name']}. Shared evidence terms: {', '.join(shared) or 'none'}.",
-                "model_version": "transparent-tfidf-v1",
+                "explanation": explanation,
+                "model_version": ("hybrid-semantic-llm-v2" if semantic_score is not None
+                                  else "transparent-tfidf-v1"),
                 "scored_at": utcnow(),
             }
             upsert(conn, "theme_matches", pair_row,
                    ["researcher_id", "opportunity_id", "theme_id"])
             key = (researcher["researcher_id"], opp["opportunity_id"])
             if key not in best or fit[0] > best[key][0][0]:
-                best[key] = (fit, theme, researcher, opp)
-    for (rid, oid), (fit, theme, researcher, opp) in best.items():
+                best[key] = (fit, theme, researcher, opp, explanation)
+    for (rid, oid), (fit, theme, researcher, opp, explanation) in best.items():
         status, reasons = eligibility(researcher, opp)
-        score, topic, method, domain, evidence, shared = fit
+        score, topic, method, domain, evidence, semantic_score, llm_score, shared = fit
         row = {"researcher_id": rid, "opportunity_id": oid, "theme_id": theme["theme_id"],
                "eligibility_status": status, "eligibility_reasons": reasons,
                "scientific_fit": round(score,1), "topic_score": round(topic,1),
                "method_score": None if method is None else round(method,1),
                "domain_score": None if domain is None else round(domain,1),
-               "evidence_score": round(evidence,1), "matched_terms": shared,
-               "explanation": f"Best theme: {theme['theme_name']}. Shared evidence terms: {', '.join(shared) or 'none'}.",
-               "model_version": "transparent-tfidf-v1", "scored_at": utcnow()}
+               "evidence_score": round(evidence,1),
+               "semantic_score": None if semantic_score is None else round(semantic_score,1),
+               "llm_score": None if llm_score is None else round(llm_score,1),
+               "matched_terms": shared, "explanation": explanation,
+               "model_version": ("hybrid-semantic-llm-v2" if semantic_score is not None
+                                 else "transparent-tfidf-v1"),
+               "scored_at": utcnow()}
         upsert(conn, "matches", row, ["researcher_id","opportunity_id"])
     conn.commit()
     return len(best)

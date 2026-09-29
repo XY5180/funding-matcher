@@ -2,8 +2,9 @@
 
 import hashlib
 import json
-
-from openai import OpenAI
+import math
+import urllib.error
+import urllib.request
 
 from .clients import utcnow
 from .db import upsert
@@ -41,6 +42,121 @@ THEME_SCHEMA = {
     "required": ["themes"],
     "additionalProperties": False,
 }
+
+
+def _post_openai(path, api_key, payload, timeout=90):
+    """Call OpenAI directly so deployment does not depend on SDK versions."""
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/" + path.lstrip("/"),
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI HTTP {exc.code}: {detail[:800]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Cannot reach OpenAI: {exc.reason}") from exc
+
+
+def _structured_chat(api_key, model, messages, schema, name):
+    payload = _post_openai("chat/completions", api_key, {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.1,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": name, "strict": True, "schema": schema},
+        },
+    })
+    content = payload["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+
+def embed_texts(api_key, texts, model="text-embedding-3-small"):
+    """Return normalized OpenAI embeddings for non-empty texts."""
+    cleaned = [" ".join(str(text).split())[:12000] or "empty" for text in texts]
+    payload = _post_openai("embeddings", api_key, {
+        "model": model,
+        "input": cleaned,
+        "encoding_format": "float",
+    })
+    ordered = sorted(payload["data"], key=lambda item: item["index"])
+    vectors = []
+    for item in ordered:
+        vector = item["embedding"]
+        norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+        vectors.append([value / norm for value in vector])
+    return vectors
+
+
+RERANK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "matches": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "opportunity_id": {"type": "string"},
+                    "relevance_score": {"type": "number"},
+                    "explanation": {"type": "string"},
+                },
+                "required": ["opportunity_id", "relevance_score", "explanation"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["matches"],
+    "additionalProperties": False,
+}
+
+
+def rerank_opportunities(api_key, theme, opportunities, model="gpt-4o-mini"):
+    """Scientifically rerank one theme's shortlisted opportunities in one call."""
+    if not opportunities:
+        return {}
+    compact = [{
+        "opportunity_id": item["opportunity_id"],
+        "title": item["title"],
+        "agency": item.get("agency") or "",
+        "description": (item.get("description") or "")[:2200],
+        "funding_categories": item.get("funding_categories") or "",
+        "funding_instruments": item.get("funding_instruments") or "",
+    } for item in opportunities]
+    parsed = _structured_chat(api_key, model, [
+        {"role": "system", "content": (
+            "You are a conservative scientific funding analyst. Score research "
+            "relevance, not application success, prestige, or eligibility."
+        )},
+        {"role": "user", "content": (
+            "Score every opportunity from 0 to 100 for scientific alignment with "
+            "this research theme. Consider topic, methods, disease/population, "
+            "data type, and whether the award mechanism supports the proposed "
+            "research rather than only infrastructure or coordination. Do not "
+            "reward generic words.\n\nTHEME:\n"
+            + json.dumps(theme, ensure_ascii=False)
+            + "\n\nOPPORTUNITIES:\n"
+            + json.dumps(compact, ensure_ascii=False)
+        )},
+    ], RERANK_SCHEMA, "funding_rerank")
+    allowed = {item["opportunity_id"] for item in opportunities}
+    output = {}
+    for item in parsed.get("matches", []):
+        opportunity_id = str(item.get("opportunity_id") or "")
+        if opportunity_id not in allowed:
+            continue
+        output[opportunity_id] = {
+            "score": max(0.0, min(100.0, float(item["relevance_score"]))),
+            "explanation": " ".join(str(item["explanation"]).split())[:500],
+        }
+    return output
 
 
 def _clean_list(values, limit=24):
@@ -143,28 +259,15 @@ INSTRUCTIONS:
 - Include the strongest supporting papers for each theme.
 - Summaries should be concise complete sentences, not keyword fragments.
 """
-    client = OpenAI(api_key=api_key)
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
+    parsed = _structured_chat(
+        api_key, model, [
             {"role": "system", "content": (
                 "You are a conservative scientific research analyst. "
                 "Return only evidence-grounded structured data."
             )},
             {"role": "user", "content": prompt},
         ],
-        temperature=0.1,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "research_themes",
-                "strict": True,
-                "schema": THEME_SCHEMA,
-            },
-        },
-    )
-    content = response.choices[0].message.content
-    parsed = json.loads(content)
+        THEME_SCHEMA, "research_themes")
     themes = parsed.get("themes") or []
     if len(themes) != 3:
         raise ValueError(f"OpenAI returned {len(themes)} themes instead of 3")

@@ -96,8 +96,11 @@ Scopus theme generation and matches the entered themes directly.
 When `OPENAI_API_KEY` is configured, the first two modes can use `gpt-4o-mini`
 to produce evidence-grounded structured themes. The model is instructed to
 minimize theme overlap and assign each supporting paper to at most one theme.
-The local transparent algorithm remains available and is used automatically
-if the OpenAI request fails. Manual-theme mode never calls OpenAI.
+All three modes can also use `text-embedding-3-small` semantic similarity and
+`gpt-4o-mini` funding reranking. The local transparent algorithm remains
+available and is used automatically if an OpenAI request fails. OpenAI is
+called through HTTPS directly, so the deployment does not depend on a
+particular version of the OpenAI Python package.
 
 The default example profile is Dajiang Liu (faculty, Penn State College of
 Medicine, United States, independent PI, no animal-model work) with the Scopus
@@ -114,7 +117,9 @@ deployment-specific environment/config propagation issues.
 
 If `SIMPLER_GRANTS_API_KEY` is also configured, the page can search live
 opportunities from Simpler.Grants.gov. Otherwise it uses the included dated
-funding snapshot. Neither path requires Pure.
+funding snapshot. Live mode builds a separate query and candidate pool for
+each research theme (up to 50 candidates per theme); users do not need to
+enter another funding-search query. Neither path requires Pure.
 
 If the Simpler.Grants.gov key is invalid or the live service is temporarily
 unavailable, the web app displays a warning and automatically falls back to
@@ -222,16 +227,17 @@ Eligibility is reported independently:
 
 Scientific fit is a 0–100 score:
 
-- research theme text similarity: 45%;
-- topic coverage: 20%;
-- method coverage: 15%;
-- disease/population coverage: 10%;
-- prior output evidence: 10%.
+- without OpenAI, the existing transparent TF-IDF/topic, method, domain, and
+  publication-evidence score is used;
+- with OpenAI, the hybrid score emphasizes semantic similarity (45%), retains
+  transparent topic similarity (25%), adds a scientific LLM review (20%), and
+  uses smaller method, domain, and publication-evidence components;
+- the LLM review explicitly checks whether an award supports the research
+  rather than only infrastructure or coordinating-center work.
 
-Weights renormalize when an opportunity lacks a component. OpenAI currently
-improves theme generation only; the funding score remains the same auditable
-local calculation. Evaluate an embedding or LLM reranking layer against human
-labels before it replaces or augments `weighted_fit()`.
+Weights renormalize when a component is unavailable. The CSV includes topic,
+method, domain, evidence, semantic, and LLM component scores so each ranking
+can be reviewed. Scientific fit measures alignment, not application success.
 
 ## Pure endpoint assumptions
 
