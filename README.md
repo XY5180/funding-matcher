@@ -128,9 +128,11 @@ deployment-specific environment/config propagation issues.
 
 If `SIMPLER_GRANTS_API_KEY` is also configured, the page can search live
 opportunities from Simpler.Grants.gov. Otherwise it uses the included dated
-funding snapshot. Live mode builds several precise AND queries for each
-research theme, merges their results, and removes duplicate opportunities
-before ranking (up to 50 unique candidates per theme). Users do not need to
+funding snapshot. Live mode builds several broad OR queries for each research
+theme, merges their results, records every query that found a candidate, and
+removes duplicate opportunities before ranking (up to 100 unique candidates
+per theme). A single meaningful concept match is enough to enter human review;
+it receives a lower score instead of being discarded. Users do not need to
 enter another funding-search query. Neither path requires Pure.
 
 If the Simpler.Grants.gov key is invalid or the live service is temporarily
@@ -246,17 +248,18 @@ Scientific fit is a 0–100 score:
   method and domain components;
 - research evidence strength is shown separately and is not part of funding
   fit;
-- the LLM applies a strict alignment rubric and separately scores disease,
-  population, and funding-mechanism alignment. Unrelated, generic-overlap,
-  disease/population-mismatch, and infrastructure-only results receive hard
-  score caps.
+- the LLM separately scores research objective (30%), disease/domain (25%),
+  funding mechanism (20%), method (15%), and population/data context (10%);
+- hard mismatches limit high recommendations but remain visible for review;
+- the page separates recommended matches from **Other opportunities to
+  review**, which includes candidates with at least one meaningful overlap.
 
 Weights renormalize when a component is unavailable. The CSV includes topic,
 method, domain, evidence, semantic, and LLM component scores so each ranking
 can be reviewed. The web app recommends only matches at or above the selected
-threshold (35/100 by default); otherwise it displays **No strong match** rather
-than forcing a recommendation. Scientific fit measures alignment, not
-application success.
+threshold (35/100 by default). If none qualify, it displays **No strong match**
+without hiding lower-scoring review candidates. Scientific fit measures
+alignment, not application success.
 
 ## Pure endpoint assumptions
 

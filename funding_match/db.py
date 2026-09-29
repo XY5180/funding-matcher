@@ -55,7 +55,9 @@ CREATE TABLE IF NOT EXISTS matches(
   scientific_fit REAL, topic_score REAL, method_score REAL,
   domain_score REAL, evidence_score REAL, semantic_score REAL, llm_score REAL,
   alignment_label TEXT, disease_match_score REAL, population_match_score REAL,
+  objective_match_score REAL, method_match_score REAL,
   mechanism_fit_score REAL, hard_mismatch INTEGER, mismatch_reason TEXT,
+  matched_dimensions TEXT, missing_dimensions TEXT,
   matched_terms TEXT,
   explanation TEXT, model_version TEXT, scored_at TEXT,
   PRIMARY KEY(researcher_id, opportunity_id));
@@ -65,7 +67,9 @@ CREATE TABLE IF NOT EXISTS theme_matches(
   scientific_fit REAL, topic_score REAL, method_score REAL,
   domain_score REAL, evidence_score REAL, semantic_score REAL, llm_score REAL,
   alignment_label TEXT, disease_match_score REAL, population_match_score REAL,
+  objective_match_score REAL, method_match_score REAL,
   mechanism_fit_score REAL, hard_mismatch INTEGER, mismatch_reason TEXT,
+  matched_dimensions TEXT, missing_dimensions TEXT,
   matched_terms TEXT,
   explanation TEXT, model_version TEXT, scored_at TEXT,
   PRIMARY KEY(researcher_id, opportunity_id, theme_id));
@@ -89,7 +93,9 @@ def connect(path):
             ("semantic_score", "REAL"), ("llm_score", "REAL"),
             ("alignment_label", "TEXT"), ("disease_match_score", "REAL"),
             ("population_match_score", "REAL"), ("mechanism_fit_score", "REAL"),
+            ("objective_match_score", "REAL"), ("method_match_score", "REAL"),
             ("hard_mismatch", "INTEGER"), ("mismatch_reason", "TEXT"),
+            ("matched_dimensions", "TEXT"), ("missing_dimensions", "TEXT"),
         ):
             if column not in existing:
                 conn.execute(

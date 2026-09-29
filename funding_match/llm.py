@@ -112,17 +112,27 @@ RERANK_SCHEMA = {
                         "enum": ["unrelated", "generic_overlap", "adjacent",
                                  "partial_match", "direct_match"],
                     },
+                    "objective_match_score": {"type": "number"},
                     "disease_match_score": {"type": "number"},
+                    "method_match_score": {"type": "number"},
                     "population_match_score": {"type": "number"},
                     "mechanism_fit_score": {"type": "number"},
+                    "matched_dimensions": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "missing_dimensions": {
+                        "type": "array", "items": {"type": "string"},
+                    },
                     "hard_mismatch": {"type": "boolean"},
                     "mismatch_reason": {"type": "string"},
                     "explanation": {"type": "string"},
                 },
                 "required": [
                     "opportunity_id", "relevance_score", "alignment_label",
-                    "disease_match_score", "population_match_score",
+                    "objective_match_score", "disease_match_score",
+                    "method_match_score", "population_match_score",
                     "mechanism_fit_score", "hard_mismatch",
+                    "matched_dimensions", "missing_dimensions",
                     "mismatch_reason", "explanation",
                 ],
                 "additionalProperties": False,
@@ -319,23 +329,24 @@ def rerank_opportunities(api_key, theme, opportunities, model="gpt-4o-mini"):
             "relevance, not application success, prestige, or eligibility."
         )},
         {"role": "user", "content": (
-            "Score every opportunity from 0 to 100 for scientific alignment with "
-            "this research theme. Consider topic, methods, disease/population, "
-            "data type, and whether the award mechanism supports the proposed "
-            "research rather than only infrastructure or coordination. Do not "
-            "reward generic words. Use this strict relevance rubric: 0-15 means "
-            "unrelated; 16-30 means only a generic method or population overlaps; "
-            "31-50 means an adjacent field with a different core question; 51-70 "
-            "means partially direct alignment; 71-85 means highly aligned; 86-100 "
-            "means the disease, question, methods, population, and award mechanism "
-            "are directly aligned. For disease_match_score and "
-            "population_match_score, use 0 for a clear mismatch, 50 when the "
-            "announcement does not specify that facet, and 100 for a direct match. "
+            "Score every opportunity for scientific alignment with this theme. "
+            "A match on even one meaningful scientific dimension must be retained "
+            "for human review; give it a low score rather than calling it unrelated. "
+            "Score five dimensions separately: research objective/question, disease "
+            "or domain, method, population/data context, and funding mechanism. "
+            "Use 0 for a clear mismatch, 50 when the announcement is silent or only "
+            "broadly adjacent, and 100 for a direct match. Populate matched_dimensions "
+            "and missing_dimensions using only: objective, disease, method, population, "
+            "mechanism. Do not reward generic words. Overall rubric: 0-14 means no "
+            "meaningful scientific overlap; 15-34 means one limited but reviewable "
+            "overlap; 35-49 means adjacent; 50-69 means possible; 70-84 means strong; "
+            "85-100 means directly aligned across most dimensions. "
             "Set hard_mismatch=true when the primary disease, target population, "
             "or scientific objective conflicts with the theme. Infrastructure-only "
             "or coordinating-center awards must receive mechanism_fit_score <=25 "
-            "unless the theme explicitly proposes that role. The explanation and "
-            "numeric scores must agree.\n\nTHEME:\n"
+            "unless the theme explicitly proposes that role. A hard mismatch limits "
+            "a high recommendation but does not remove the opportunity from review. "
+            "The explanation and numeric scores must agree.\n\nTHEME:\n"
             + json.dumps(theme, ensure_ascii=False)
             + "\n\nOPPORTUNITIES:\n"
             + json.dumps(compact, ensure_ascii=False)
@@ -350,12 +361,18 @@ def rerank_opportunities(api_key, theme, opportunities, model="gpt-4o-mini"):
         output[opportunity_id] = {
             "score": max(0.0, min(100.0, float(item["relevance_score"]))),
             "alignment_label": item["alignment_label"],
+            "objective_match_score": max(
+                0.0, min(100.0, float(item["objective_match_score"]))),
             "disease_match_score": max(
                 0.0, min(100.0, float(item["disease_match_score"]))),
+            "method_match_score": max(
+                0.0, min(100.0, float(item["method_match_score"]))),
             "population_match_score": max(
                 0.0, min(100.0, float(item["population_match_score"]))),
             "mechanism_fit_score": max(
                 0.0, min(100.0, float(item["mechanism_fit_score"]))),
+            "matched_dimensions": _clean_list(item["matched_dimensions"], 5),
+            "missing_dimensions": _clean_list(item["missing_dimensions"], 5),
             "hard_mismatch": bool(item["hard_mismatch"]),
             "mismatch_reason": " ".join(
                 str(item["mismatch_reason"]).split())[:300],

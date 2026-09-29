@@ -154,7 +154,7 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
             try:
                 opportunity_count = sync_grants_by_theme(
                     conn, run_config, "web-form-researcher",
-                    api_key=simpler_grants_api_key, max_per_theme=50)
+                    api_key=simpler_grants_api_key, max_per_theme=100)
                 if not opportunity_count:
                     raise ValueError(
                         "Simpler.Grants.gov returned no opportunities for this query")
@@ -244,9 +244,12 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                    m.domain_score, m.evidence_score, m.semantic_score,
                    m.llm_score, m.model_version, m.eligibility_status,
                    m.eligibility_reasons, m.matched_terms, m.explanation,
-                   m.alignment_label, m.disease_match_score,
+                   m.alignment_label, m.objective_match_score,
+                   m.disease_match_score, m.method_match_score,
                    m.population_match_score, m.mechanism_fit_score,
                    m.hard_mismatch, m.mismatch_reason,
+                   m.matched_dimensions, m.missing_dimensions,
+                   c.query_text AS retrieval_queries,
                    t.theme_name, t.coherence_score AS theme_coherence_score,
                    t.separation_score AS theme_separation_score,
                    t.stability_score AS theme_stability_score,
@@ -256,6 +259,10 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
             FROM matches m
             JOIN opportunities o USING(opportunity_id)
             JOIN research_themes t USING(theme_id)
+            LEFT JOIN theme_opportunity_candidates c
+              ON c.researcher_id=m.researcher_id
+             AND c.theme_id=m.theme_id
+             AND c.opportunity_id=m.opportunity_id
             WHERE m.researcher_id='web-form-researcher'
             ORDER BY CASE m.eligibility_status
                        WHEN 'eligible' THEN 0 WHEN 'review' THEN 1 ELSE 2 END,
@@ -266,9 +273,12 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                    tm.domain_score, tm.evidence_score, tm.semantic_score,
                    tm.llm_score, tm.model_version, tm.eligibility_status,
                    tm.eligibility_reasons, tm.matched_terms, tm.explanation,
-                   tm.alignment_label, tm.disease_match_score,
+                   tm.alignment_label, tm.objective_match_score,
+                   tm.disease_match_score, tm.method_match_score,
                    tm.population_match_score, tm.mechanism_fit_score,
                    tm.hard_mismatch, tm.mismatch_reason,
+                   tm.matched_dimensions, tm.missing_dimensions,
+                   c.query_text AS retrieval_queries,
                    t.theme_name, t.theme_id,
                    t.coherence_score AS theme_coherence_score,
                    t.separation_score AS theme_separation_score,
@@ -279,6 +289,10 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
             FROM theme_matches tm
             JOIN opportunities o USING(opportunity_id)
             JOIN research_themes t USING(theme_id)
+            LEFT JOIN theme_opportunity_candidates c
+              ON c.researcher_id=tm.researcher_id
+             AND c.theme_id=tm.theme_id
+             AND c.opportunity_id=tm.opportunity_id
             WHERE tm.researcher_id='web-form-researcher'
             ORDER BY t.theme_name,
                      CASE tm.eligibility_status
@@ -289,6 +303,18 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                 [dict(row) for row in theme_rows], funding_source,
                 imported_publications, resolved_author_id, opportunity_count,
                 warning_message, generated_themes, theme_source)
+
+
+def parse_list_value(value):
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else [str(parsed)]
+    except (TypeError, json.JSONDecodeError):
+        return [str(value)]
 
 
 def render_score_details(row):
@@ -312,7 +338,9 @@ def render_score_details(row):
     alignment = row.get("alignment_label")
     alignment_parts = []
     for label, key in [
+        ("Objective", "objective_match_score"),
         ("Disease", "disease_match_score"),
+        ("Method", "method_match_score"),
         ("Population", "population_match_score"),
         ("Mechanism", "mechanism_fit_score"),
     ]:
@@ -325,6 +353,15 @@ def render_score_details(row):
             f"Alignment class: {label_text}"
             + (" · " + " · ".join(alignment_parts) if alignment_parts else "")
         )
+    matched_dimensions = parse_list_value(row.get("matched_dimensions"))
+    missing_dimensions = parse_list_value(row.get("missing_dimensions"))
+    if matched_dimensions:
+        st.write("**Matched research dimensions:** " + ", ".join(matched_dimensions))
+    if missing_dimensions:
+        st.caption("Missing or weak dimensions: " + ", ".join(missing_dimensions))
+    retrieval_queries = parse_list_value(row.get("retrieval_queries"))
+    if retrieval_queries:
+        st.caption("Found by OR searches: " + " · ".join(retrieval_queries))
     if row.get("hard_mismatch") or row.get("mismatch_reason"):
         st.warning(
             "Mismatch check: "
@@ -335,14 +372,61 @@ def render_score_details(row):
         st.write("**Why this match:** " + row["explanation"])
 
 
-def match_band(score):
+def is_reviewable(row):
+    return bool(
+        row["scientific_fit"] >= 15
+        or parse_list_value(row.get("matched_dimensions"))
+        or parse_list_value(row.get("matched_terms"))
+    )
+
+
+def match_band(score, meaningful_overlap=False):
     if score >= 70:
         return "Strong match"
     if score >= 50:
         return "Possible match"
     if score >= 35:
         return "Adjacent opportunity"
-    return "Not recommended"
+    if score >= 15:
+        return "Limited overlap — review"
+    if meaningful_overlap:
+        return "Very limited overlap — review"
+    return "No meaningful overlap"
+
+
+def render_funding_card(row, rank, key_prefix, show_theme=False):
+    reasons = json.loads(row["eligibility_reasons"] or "[]")
+    matched = json.loads(row["matched_terms"] or "[]")
+    with st.container(border=True):
+        left, right = st.columns([4, 1])
+        with left:
+            st.markdown(f"**{rank}. {row['title']}**")
+            st.write(
+                f"{row['opportunity_number']} · {row['agency']} · "
+                f"Deadline: {row['close_date'] or 'verify'}"
+            )
+        with right:
+            st.metric("Scientific fit", f"{row['scientific_fit']:.1f}/100")
+            st.caption(match_band(row["scientific_fit"], is_reviewable(row)))
+        st.write(f"**Eligibility:** {row['eligibility_status'].upper()}")
+        if reasons:
+            st.info("Human review: " + "; ".join(reasons))
+        if show_theme:
+            st.write(f"**Best matching theme:** {row['theme_name']}")
+        st.write("**Exact phrase overlap:** " + (", ".join(matched) or "None"))
+        render_score_details(row)
+        st.link_button(
+            "Open official announcement", row["source_url"],
+            key=f"{key_prefix}-{row.get('theme_id', 'best')}-{row['opportunity_number']}",
+        )
+
+
+def exportable_row(row):
+    output = dict(row)
+    for key in ("eligibility_reasons", "matched_terms", "matched_dimensions",
+                "missing_dimensions", "retrieval_queries"):
+        output[key] = "; ".join(parse_list_value(row.get(key)))
+    return output
 
 
 def render_results(rows, snapshot_date, minimum_fit):
@@ -351,39 +435,35 @@ def render_results(rows, snapshot_date, minimum_fit):
         f"Funding source: {snapshot_date}. Scientific fit measures research "
         "alignment and is not an application-success probability."
     )
-    display_rows = [row for row in rows if row["scientific_fit"] >= minimum_fit]
+    display_rows = [
+        row for row in rows
+        if row["scientific_fit"] >= minimum_fit
+        and row["eligibility_status"] != "ineligible"
+    ]
+    review_rows = [
+        row for row in rows
+        if row["scientific_fit"] < minimum_fit and is_reviewable(row)
+        and row["eligibility_status"] != "ineligible"
+    ]
     if not display_rows:
         st.warning("No strong match was found above the selected scientific-fit threshold.")
-        return
     for rank, row in enumerate(display_rows, start=1):
-        reasons = json.loads(row["eligibility_reasons"] or "[]")
-        matched = json.loads(row["matched_terms"] or "[]")
-        with st.container(border=True):
-            left, right = st.columns([4, 1])
-            with left:
-                st.markdown(f"### {rank}. {row['title']}")
-                st.write(
-                    f"**{row['opportunity_number']}** · {row['agency']} · "
-                    f"Deadline: {row['close_date'] or 'verify'}"
-                )
-            with right:
-                st.metric("Scientific fit", f"{row['scientific_fit']:.1f}/100")
-                st.caption(match_band(row["scientific_fit"]))
-            st.write(f"**Eligibility:** {row['eligibility_status'].upper()}")
-            if reasons:
-                st.info("Human review: " + "; ".join(reasons))
-            st.write(f"**Best matching theme:** {row['theme_name']}")
-            st.write("**Exact phrase overlap:** " + (", ".join(matched) or "None"))
-            render_score_details(row)
-            st.link_button("Open official announcement", row["source_url"])
+        render_funding_card(row, rank, "best", show_theme=True)
+    if review_rows:
+        with st.expander(
+                f"Other opportunities to review ({len(review_rows)})", expanded=True):
+            st.caption(
+                "These opportunities match at least one meaningful research dimension "
+                "but remain below the recommendation threshold."
+            )
+            for rank, row in enumerate(review_rows[:10], start=1):
+                render_funding_card(row, rank, "best-review", show_theme=True)
 
     export_rows = []
-    for row in display_rows:
-        export_rows.append({
-            **row,
-            "eligibility_reasons": "; ".join(json.loads(row["eligibility_reasons"] or "[]")),
-            "matched_terms": "; ".join(json.loads(row["matched_terms"] or "[]")),
-        })
+    for row in display_rows + review_rows:
+        export_rows.append(exportable_row(row))
+    if not export_rows:
+        return
     import csv
     import io
     output = io.StringIO()
@@ -414,44 +494,33 @@ def render_theme_results(rows, top_k, minimum_fit):
             row for row in rows
             if row["theme_name"] == theme_name
             and row["scientific_fit"] >= minimum_fit
+            and row["eligibility_status"] != "ineligible"
+        ][:top_k]
+        review_rows = [
+            row for row in rows
+            if row["theme_name"] == theme_name
+            and row["scientific_fit"] < minimum_fit and is_reviewable(row)
+            and row["eligibility_status"] != "ineligible"
         ][:top_k]
         st.markdown(f"### {theme_name}")
         if not eligible_rows:
             st.warning("No strong match was found above the selected scientific-fit threshold.")
-            continue
         for rank, row in enumerate(eligible_rows, start=1):
             selected.append(row)
-            reasons = json.loads(row["eligibility_reasons"] or "[]")
-            matched = json.loads(row["matched_terms"] or "[]")
-            with st.container(border=True):
-                left, right = st.columns([4, 1])
-                with left:
-                    st.markdown(f"**{rank}. {row['title']}**")
-                    st.write(
-                        f"{row['opportunity_number']} · {row['agency']} · "
-                        f"Deadline: {row['close_date'] or 'verify'}"
-                    )
-                with right:
-                    st.metric("Scientific fit", f"{row['scientific_fit']:.1f}/100")
-                    st.caption(match_band(row["scientific_fit"]))
-                st.write(f"**Eligibility:** {row['eligibility_status'].upper()}")
-                if reasons:
-                    st.info("Human review: " + "; ".join(reasons))
-                st.write("**Exact phrase overlap:** " + (", ".join(matched) or "None"))
-                render_score_details(row)
-                st.link_button("Open official announcement", row["source_url"],
-                               key=f"theme-link-{row['theme_id']}-{row['opportunity_number']}")
+            render_funding_card(row, rank, "theme")
+        if review_rows:
+            selected.extend(review_rows)
+            with st.expander(
+                    f"Other opportunities to review ({len(review_rows)})", expanded=True):
+                for rank, row in enumerate(review_rows, start=1):
+                    render_funding_card(row, rank, "theme-review")
 
     if selected:
         import csv
         import io
         export_rows = []
         for row in selected:
-            export_rows.append({
-                **row,
-                "eligibility_reasons": "; ".join(json.loads(row["eligibility_reasons"] or "[]")),
-                "matched_terms": "; ".join(json.loads(row["matched_terms"] or "[]")),
-            })
+            export_rows.append(exportable_row(row))
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=export_rows[0].keys())
         writer.writeheader(); writer.writerows(export_rows)

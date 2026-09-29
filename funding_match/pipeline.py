@@ -310,8 +310,8 @@ def sync_grants(conn, config, query="", api_key=""):
     return n
 
 
-def theme_search_queries(theme, limit=4):
-    """Build several concise AND queries covering complementary theme facets."""
+def theme_search_queries(theme, limit=6):
+    """Build broad OR queries so one meaningful concept can enter review."""
     name = " ".join(str(theme["theme_name"] or "").split())
     keywords = decode_list(theme["keywords"])
     methods = decode_list(theme["methods"])
@@ -319,24 +319,35 @@ def theme_search_queries(theme, limit=4):
     populations = decode_list(theme["populations"])
     data_types = decode_list(theme["data_types"])
 
-    def combine(*parts):
-        return " ".join(" ".join(str(part).split()) for part in parts if part)[:100]
+    generic = {
+        "analysis", "data", "health", "learning", "model", "models",
+        "patients", "prediction", "research", "study", "using",
+    }
 
-    proposals = [name]
-    primary_topic = diseases[0] if diseases else (keywords[0] if keywords else name)
-    proposals.append(combine(primary_topic, keywords[0] if keywords else ""))
-    proposals.append(combine(primary_topic,
-                             methods[0] if methods else
-                             (keywords[1] if len(keywords) > 1 else "")))
-    proposals.append(combine(populations[0] if populations else "",
-                             primary_topic,
-                             data_types[0] if data_types else ""))
-    if len(keywords) > 1:
-        proposals.append(combine(keywords[0], keywords[1]))
+    def useful(values, maximum=5):
+        output = []
+        for value in values:
+            value = " ".join(str(value).split()).strip()
+            tokens = re.findall(r"[a-z][a-z0-9-]+", value.casefold())
+            if not value or not any(token not in generic for token in tokens):
+                continue
+            if value.casefold() not in {item.casefold() for item in output}:
+                output.append(value)
+            if len(output) >= maximum:
+                break
+        return output
+
+    proposals = [
+        useful(diseases + keywords[:3]),
+        useful(methods + keywords[1:4]),
+        useful(populations + data_types + keywords[:2]),
+        useful(keywords, 6),
+        useful([name] + diseases + methods, 5),
+    ]
 
     selected = []
-    for query in proposals:
-        query = " ".join(query.split()).strip()
+    for concepts in proposals:
+        query = " ".join(concepts)[:100].strip()
         if query and query.casefold() not in {item.casefold() for item in selected}:
             selected.append(query)
         if len(selected) >= limit:
@@ -350,8 +361,8 @@ def theme_search_query(theme, keyword_limit=5):
 
 
 def sync_grants_by_theme(conn, config, researcher_id, api_key="",
-                         max_per_theme=50):
-    """Retrieve a separate candidate pool for every research theme."""
+                         max_per_theme=100):
+    """Broadly retrieve and deduplicate reviewable candidates per theme."""
     themes = conn.execute(
         "SELECT * FROM research_themes WHERE researcher_id=? ORDER BY theme_id",
         (researcher_id,),
@@ -364,24 +375,23 @@ def sync_grants_by_theme(conn, config, researcher_id, api_key="",
     for theme in themes:
         queries = theme_search_queries(theme)
         theme_opportunities = set()
+        query_hits = {}
         per_query = max(10, math.ceil(max_per_theme / len(queries)))
         for query in queries:
             query_written = 0
             for raw in SimplerGrantsClient(
                     config, api_key=api_key).opportunities(
-                        query, query_operator="AND"):
+                        query, query_operator="OR"):
                 row = normalize_grant(raw)
                 opportunity_id = row["opportunity_id"]
-                if not opportunity_id or opportunity_id in theme_opportunities:
+                if not opportunity_id:
+                    continue
+                query_hits.setdefault(opportunity_id, [])
+                if query not in query_hits[opportunity_id]:
+                    query_hits[opportunity_id].append(query)
+                if opportunity_id in theme_opportunities:
                     continue
                 upsert(conn, "opportunities", row, ["opportunity_id"])
-                upsert(conn, "theme_opportunity_candidates", {
-                    "researcher_id": researcher_id,
-                    "theme_id": theme["theme_id"],
-                    "opportunity_id": opportunity_id,
-                    "query_text": query,
-                    "retrieved_at": utcnow(),
-                }, ["researcher_id", "theme_id", "opportunity_id"])
                 unique_opportunities.add(opportunity_id)
                 theme_opportunities.add(opportunity_id)
                 query_written += 1
@@ -390,6 +400,14 @@ def sync_grants_by_theme(conn, config, researcher_id, api_key="",
             if len(theme_opportunities) >= max_per_theme:
                 break
             time.sleep(0.55)
+        for opportunity_id in theme_opportunities:
+            upsert(conn, "theme_opportunity_candidates", {
+                "researcher_id": researcher_id,
+                "theme_id": theme["theme_id"],
+                "opportunity_id": opportunity_id,
+                "query_text": query_hits.get(opportunity_id, []),
+                "retrieved_at": utcnow(),
+            }, ["researcher_id", "theme_id", "opportunity_id"])
     conn.commit()
     return len(unique_opportunities)
 
@@ -645,7 +663,7 @@ def cosine(a, b, idf):
     nb = math.sqrt(sum(v*v*idf.get(t,1)**2 for t,v in b.items()))
     return dot/(na*nb) if na and nb else 0.0
 
-def weighted_fit(theme, opp, idf, semantic=None, llm=None):
+def weighted_fit(theme, opp, idf, semantic=None, llm=None, review=None):
     ttext = " ".join(str(theme[k] or "") for k in ("theme_name","summary","keywords","methods","diseases","populations","data_types"))
     otext = " ".join(str(opp[k] or "") for k in ("title","description","funding_categories"))
     ta, ob = Counter(terms(ttext)), Counter(terms(otext))
@@ -669,6 +687,17 @@ def weighted_fit(theme, opp, idf, semantic=None, llm=None):
         if method is not None: parts.append((0.03, method))
         if domain is not None: parts.append((0.02, domain))
     score = sum(w*s for w,s in parts)/sum(w for w,_ in parts)
+    if review:
+        # Human screening starts from the number and depth of scientifically
+        # aligned dimensions. A single real overlap remains visible with a low
+        # score; agreement across several dimensions raises the score.
+        score = (
+            0.30 * review["objective_match_score"]
+            + 0.25 * review["disease_match_score"]
+            + 0.20 * review["mechanism_fit_score"]
+            + 0.15 * review["method_match_score"]
+            + 0.10 * review["population_match_score"]
+        ) / 100
     shared = matched_keyphrases(theme, opp, ta, ob, idf)
     return (100*score, 100*topic, None if method is None else 100*method,
             None if domain is None else 100*domain, 100*evidence,
@@ -681,7 +710,7 @@ def apply_alignment_caps(score, theme, review):
     if not review:
         return score
     label_caps = {
-        "unrelated": 25.0,
+        "unrelated": 14.0,
         "generic_overlap": 34.0,
         "adjacent": 49.0,
         "partial_match": 69.0,
@@ -689,14 +718,14 @@ def apply_alignment_caps(score, theme, review):
     }
     score = min(score, label_caps.get(review.get("alignment_label"), 100.0))
     if review.get("hard_mismatch"):
-        score = min(score, 25.0)
+        score = min(score, 49.0)
     if decode_list(theme["diseases"]) and review.get("disease_match_score", 50) <= 20:
-        score = min(score, 30.0)
+        score = min(score, 49.0)
     if (decode_list(theme["populations"])
             and review.get("population_match_score", 50) <= 20):
-        score = min(score, 30.0)
-    if review.get("mechanism_fit_score", 100) <= 25:
         score = min(score, 55.0)
+    if review.get("mechanism_fit_score", 100) <= 25:
+        score = min(score, 49.0)
     return score
 
 
@@ -846,7 +875,8 @@ def match_all(conn, openai_api_key="", openai_model="gpt-4o-mini",
             sem = semantic.get(match_key)
             review = llm_reviews.get(match_key)
             llm_value = None if review is None else review["score"] / 100
-            fit = weighted_fit(theme, opp, idf, semantic=sem, llm=llm_value)
+            fit = weighted_fit(
+                theme, opp, idf, semantic=sem, llm=llm_value, review=review)
             fit = (apply_alignment_caps(fit[0], theme, review), *fit[1:])
             status, reasons = eligibility(researcher, opp)
             score, topic, method, domain, evidence, semantic_score, llm_score, shared = fit
@@ -867,14 +897,18 @@ def match_all(conn, openai_api_key="", openai_model="gpt-4o-mini",
                 "semantic_score": None if semantic_score is None else round(semantic_score, 1),
                 "llm_score": None if llm_score is None else round(llm_score, 1),
                 "alignment_label": None if review is None else review["alignment_label"],
+                "objective_match_score": None if review is None else review["objective_match_score"],
                 "disease_match_score": None if review is None else review["disease_match_score"],
+                "method_match_score": None if review is None else review["method_match_score"],
                 "population_match_score": None if review is None else review["population_match_score"],
                 "mechanism_fit_score": None if review is None else review["mechanism_fit_score"],
                 "hard_mismatch": None if review is None else int(review["hard_mismatch"]),
                 "mismatch_reason": None if review is None else review["mismatch_reason"],
+                "matched_dimensions": [] if review is None else review["matched_dimensions"],
+                "missing_dimensions": [] if review is None else review["missing_dimensions"],
                 "matched_terms": shared,
                 "explanation": explanation,
-                "model_version": ("hybrid-semantic-llm-v3-capped" if semantic_score is not None
+                "model_version": ("dimension-weighted-llm-v4" if semantic_score is not None
                                   else "transparent-tfidf-v1"),
                 "scored_at": utcnow(),
             }
@@ -895,13 +929,17 @@ def match_all(conn, openai_api_key="", openai_model="gpt-4o-mini",
                "semantic_score": None if semantic_score is None else round(semantic_score,1),
                "llm_score": None if llm_score is None else round(llm_score,1),
                "alignment_label": None if review is None else review["alignment_label"],
+               "objective_match_score": None if review is None else review["objective_match_score"],
                "disease_match_score": None if review is None else review["disease_match_score"],
+               "method_match_score": None if review is None else review["method_match_score"],
                "population_match_score": None if review is None else review["population_match_score"],
                "mechanism_fit_score": None if review is None else review["mechanism_fit_score"],
                "hard_mismatch": None if review is None else int(review["hard_mismatch"]),
                "mismatch_reason": None if review is None else review["mismatch_reason"],
+               "matched_dimensions": [] if review is None else review["matched_dimensions"],
+               "missing_dimensions": [] if review is None else review["missing_dimensions"],
                "matched_terms": shared, "explanation": explanation,
-               "model_version": ("hybrid-semantic-llm-v3-capped" if semantic_score is not None
+               "model_version": ("dimension-weighted-llm-v4" if semantic_score is not None
                                  else "transparent-tfidf-v1"),
                "scored_at": utcnow()}
         upsert(conn, "matches", row, ["researcher_id","opportunity_id"])
