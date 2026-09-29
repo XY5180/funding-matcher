@@ -315,6 +315,71 @@ def phrases(text, vocabulary):
     lower = (text or "").lower()
     return sorted(p for p in vocabulary if p in lower)
 
+
+GENERIC_THEME_TERMS = {
+    "analysis", "associated", "association", "data", "effect", "findings",
+    "health", "identifies", "learning", "method", "model", "models",
+    "patients", "prediction", "research", "results", "study", "use", "using",
+}
+GENERIC_BOUNDARY_TERMS = {
+    "associated", "findings", "identifies", "results", "study", "use", "using",
+}
+
+
+def rank_keyphrases(texts, titles=None, limit=24):
+    """Rank readable scientific phrases, using titles more heavily than abstracts."""
+    titles = titles or texts
+    document_phrases = Counter()
+    weighted = Counter()
+
+    def add_ngrams(text, weight, max_n):
+        tokens = terms(text)
+        seen = set()
+        for size in range(2, max_n + 1):
+            for start in range(len(tokens) - size + 1):
+                words = tokens[start:start + size]
+                if (words[0] in GENERIC_BOUNDARY_TERMS
+                        or words[-1] in GENERIC_BOUNDARY_TERMS):
+                    continue
+                phrase = " ".join(words)
+                weighted[phrase] += weight * size
+                seen.add(phrase)
+        for phrase in seen:
+            document_phrases[phrase] += 1
+
+    for title in titles:
+        add_ngrams(title, weight=4.0, max_n=4)
+    for text in texts:
+        add_ngrams(text, weight=0.7, max_n=3)
+
+    candidates = Counter()
+    for phrase, score in weighted.items():
+        frequency = document_phrases[phrase]
+        candidates[phrase] = score * (1 + math.log1p(frequency))
+
+    # Specific single terms are only a fallback after multi-word phrases.
+    unigrams = Counter(t for text in texts for t in terms(text)
+                       if t not in GENERIC_THEME_TERMS)
+    ordered = [phrase for phrase, _ in candidates.most_common()]
+    ordered += [term for term, _ in unigrams.most_common()]
+
+    selected = []
+    for phrase in ordered:
+        phrase_tokens = set(phrase.split())
+        redundant = False
+        for existing in selected:
+            existing_tokens = set(existing.split())
+            overlap = len(phrase_tokens & existing_tokens) / max(
+                1, min(len(phrase_tokens), len(existing_tokens)))
+            if overlap >= 0.8:
+                redundant = True
+                break
+        if not redundant:
+            selected.append(phrase)
+        if len(selected) >= limit:
+            break
+    return selected
+
 def build_profiles(conn, max_themes=3, seed_keywords=None, researcher_id=None):
     if researcher_id:
         researchers = conn.execute(
@@ -375,14 +440,9 @@ def build_profiles(conn, max_themes=3, seed_keywords=None, researcher_id=None):
                 assigned = assignments[idx]
                 theme_texts = [texts[i] for i in assigned]
                 analysis_texts = theme_texts or [" ".join(group)]
-                df = Counter(t for text in analysis_texts for t in set(terms(text)))
-                scored = Counter()
-                for text in analysis_texts:
-                    counts = Counter(terms(text))
-                    for term, count in counts.items():
-                        scored[term] += count * (
-                            math.log((1 + len(analysis_texts)) / (1 + df[term])) + 1)
-                top = [term for term, _ in scored.most_common(24)]
+                assigned_titles = [rows[i]["title"] for i in assigned if i < len(rows)]
+                top = rank_keyphrases(
+                    analysis_texts, assigned_titles or analysis_texts, limit=24)
                 keywords = list(dict.fromkeys(group + top))[:24]
                 evidence = [rows[i]["output_id"] for i in assigned
                             if i < len(rows)][:12]
@@ -395,7 +455,7 @@ def build_profiles(conn, max_themes=3, seed_keywords=None, researcher_id=None):
                 row = {
                     "theme_id": tid, "researcher_id": researcher["researcher_id"],
                     "theme_name": " / ".join(group[:3]),
-                    "summary": " ".join(top[:15]) or " ".join(group),
+                    "summary": "Research focused on " + ", ".join(keywords[:6]) + ".",
                     "keywords": keywords,
                     "methods": phrases(combined, METHODS),
                     "diseases": [], "populations": [],
@@ -408,27 +468,50 @@ def build_profiles(conn, max_themes=3, seed_keywords=None, researcher_id=None):
                 written += 1
             continue
 
-        # Transparent topic construction: top weighted terms, split by recent evidence.
-        df = Counter(t for text in texts for t in set(terms(text)))
-        scored = Counter()
-        for text in texts:
-            c = Counter(terms(text))
-            for t, v in c.items():
-                scored[t] += v * (math.log((1 + len(texts))/(1 + df[t])) + 1)
-        top = [t for t, _ in scored.most_common(30)]
-        chunks = [top[i::max_themes] for i in range(max_themes)]
+        # Phrase-based fallback: choose distinct phrase seeds, then assign each
+        # paper to its strongest theme so evidence lists remain non-overlapping.
+        titles = [r["title"] or "" for r in rows]
+        ranked = rank_keyphrases(texts, titles or texts, limit=40)
+        seeds = []
+        for candidate in ranked:
+            candidate_terms = set(candidate.split())
+            if all(len(candidate_terms & set(seed.split())) /
+                   max(1, len(candidate_terms | set(seed.split()))) < 0.5
+                   for seed in seeds):
+                seeds.append(candidate)
+            if len(seeds) == max_themes:
+                break
+        seeds += [f"research theme {i + 1}" for i in range(len(seeds), max_themes)]
+        assignments = [[] for _ in range(max_themes)]
+        for text_index, text in enumerate(texts[:len(rows)]):
+            lower = text.lower()
+            text_terms = set(terms(text))
+            scores = []
+            for seed in seeds:
+                seed_terms = set(terms(seed))
+                score = len(seed_terms & text_terms)
+                if seed in lower:
+                    score += 4 + len(seed_terms)
+                scores.append(score)
+            best = scores.index(max(scores)) if max(scores, default=0) > 0 else min(
+                range(max_themes), key=lambda idx: len(assignments[idx]))
+            assignments[best].append(text_index)
         conn.execute("DELETE FROM research_themes WHERE researcher_id=? AND manually_verified=0",
                      (researcher["researcher_id"],))
-        for idx, chunk in enumerate(chunks):
-            if not chunk: continue
-            relevant = [(i, text) for i, text in enumerate(texts)
-                        if set(chunk[:8]) & set(terms(text))]
-            evidence = [rows[i]["output_id"] for i, _ in relevant if i < len(rows)][:8]
-            combined = " ".join(text for _, text in relevant[:10])
+        for idx, seed in enumerate(seeds):
+            assigned = assignments[idx]
+            theme_texts = [texts[i] for i in assigned]
+            theme_titles = [titles[i] for i in assigned]
+            keywords = rank_keyphrases(
+                theme_texts or [seed], theme_titles or [seed], limit=20)
+            keywords = list(dict.fromkeys([seed] + keywords))[:20]
+            evidence = [rows[i]["output_id"] for i in assigned][:8]
+            combined = " ".join(theme_texts[:10])
             tid = hashlib.sha1(f"{researcher['researcher_id']}:{idx}".encode()).hexdigest()[:16]
             row = {"theme_id": tid, "researcher_id": researcher["researcher_id"],
-                   "theme_name": " / ".join(chunk[:4]), "summary": " ".join(chunk[:15]),
-                   "keywords": chunk[:20], "methods": phrases(combined, METHODS),
+                   "theme_name": seed.title(),
+                   "summary": "Research focused on " + ", ".join(keywords[:6]) + ".",
+                   "keywords": keywords, "methods": phrases(combined, METHODS),
                    "diseases": [], "populations": [], "data_types": phrases(combined, DATA_TYPES),
                    "evidence_output_ids": evidence,
                    "confidence": min(1.0, 0.35 + 0.08 * len(evidence)),

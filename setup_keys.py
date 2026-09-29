@@ -19,17 +19,20 @@ def main():
 
     scopus = getpass.getpass("Paste SCOPUS_API_KEY (input is hidden): ").strip()
     simpler = getpass.getpass("Paste SIMPLER_GRANTS_API_KEY (input is hidden): ").strip()
-    if not scopus or not simpler:
-        raise SystemExit("Both keys are required. No file was written.")
+    openai = getpass.getpass("Paste OPENAI_API_KEY (input is hidden): ").strip()
+    if not scopus or not openai:
+        raise SystemExit("Scopus and OpenAI keys are required. No file was written.")
 
     content = (
         f"SCOPUS_API_KEY={scopus}\n"
         f"SIMPLER_GRANTS_API_KEY={simpler}\n"
+        f"OPENAI_API_KEY={openai}\n"
+        "OPENAI_MODEL=gpt-4o-mini\n"
         "SCOPUS_INST_TOKEN=\n"
     )
     TARGET.write_text(content, encoding="utf-8")
     os.chmod(TARGET, 0o600)
-    print("Saved both keys to .env. This file is excluded from Git by .gitignore.")
+    print("Saved API settings to .env. This file is excluded from Git by .gitignore.")
 
 
 if __name__ == "__main__":

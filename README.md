@@ -1,4 +1,4 @@
-# Funding Matcher
+# Funding Match System
 
 Runnable backend prototype for:
 
@@ -15,6 +15,7 @@ from environment variables and are never written to the database.
 ## Quick start
 
 ```bash
+cd funding_match_system
 python run_pipeline.py demo --reset
 ```
 
@@ -74,9 +75,8 @@ research themes.
 
 Scopus Search is requested in pages of 25 so the import also works with the
 basic developer service level. Choosing 50 publications uses multiple pages.
-When Scopus import is selected, the web app defaults to matching only with
-themes generated from the imported publications. Select **Also include the
-manually entered themes below** only when both sources should be combined.
+When Scopus import is selected, the web app can generate themes automatically
+or use three user-provided keyword groups to guide theme generation.
 
 The web form has two profile modes. **Default example profile** fills the
 existing demonstration researcher details, including its Scopus Author ID.
@@ -84,17 +84,21 @@ existing demonstration researcher details, including its Scopus Author ID.
 an ORCID or Scopus Author ID can be used to import publications and generate
 themes automatically.
 
-After a new researcher is matched, the three generated themes are written back
-into the Theme 1–3 fields for review. Each generated theme also lists the
-Scopus publication title(s) recorded as evidence for that theme.
+After a researcher is matched, the three generated themes are shown for
+review. Each generated theme also lists the Scopus publication title(s)
+recorded as evidence for that theme.
 
-The web workflow offers two keyword modes. **Import Indexed Keywords/MeSH from
-Scopus** retrieves each selected paper's Abstract Retrieval metadata and ranks
-the indexed terms appearing across the papers; it does not infer keywords from
-title word frequency. **Enter keywords manually** accepts three freely entered,
-comma-separated keyword groups. In either mode, the researcher defines a
-non-overlapping scope for three themes. Each imported paper is assigned to only
-its strongest matching group, so the evidence-paper lists do not overlap.
+The web workflow offers three theme modes. **Generate themes automatically from
+Scopus** builds three themes from imported paper titles and abstracts.
+**Generate themes using your keywords** accepts three comma-separated keyword
+groups and generates one theme per group. **Enter themes manually** skips
+Scopus theme generation and matches the entered themes directly.
+
+When `OPENAI_API_KEY` is configured, the first two modes can use `gpt-4o-mini`
+to produce evidence-grounded structured themes. The model is instructed to
+minimize theme overlap and assign each supporting paper to at most one theme.
+The local transparent algorithm remains available and is used automatically
+if the OpenAI request fails. Manual-theme mode never calls OpenAI.
 
 The default example profile is Dajiang Liu (faculty, Penn State College of
 Medicine, United States, independent PI, no animal-model work) with the Scopus
@@ -126,10 +130,10 @@ python setup_keys.py
 python -m streamlit run app.py
 ```
 
-`setup_keys.py` hides keyboard input, saves both keys in a local `.env` file,
+`setup_keys.py` hides keyboard input, saves the API settings in a local `.env` file,
 and restricts the file permissions. The application loads `.env`
 automatically. `.gitignore` excludes `.env`, so it must never be uploaded to
-GitHub. Alternatively, copy `.env.example` to `.env` and edit the two values.
+GitHub. Alternatively, copy `.env.example` to `.env` and edit the values.
 
 For Streamlit Community Cloud, do not upload `.env`. Add the same names under
 App settings → Secrets:
@@ -137,6 +141,8 @@ App settings → Secrets:
 ```toml
 SCOPUS_API_KEY = "..."
 SIMPLER_GRANTS_API_KEY = "..."
+OPENAI_API_KEY = "..."
+OPENAI_MODEL = "gpt-4o-mini"
 ```
 
 The command-line version can export the Top 5 opportunities for every theme:
@@ -223,9 +229,10 @@ Scientific fit is a 0–100 score:
 - disease/population coverage: 10%;
 - prior output evidence: 10%.
 
-Weights renormalize when an opportunity lacks a component. The implementation
-is a transparent baseline. Replace `weighted_fit()` with an embedding model
-after building a human-reviewed evaluation set.
+Weights renormalize when an opportunity lacks a component. OpenAI currently
+improves theme generation only; the funding score remains the same auditable
+local calculation. Evaluate an embedding or LLM reranking layer against human
+labels before it replaces or augments `weighted_fit()`.
 
 ## Pure endpoint assumptions
 
@@ -243,6 +250,7 @@ in `funding_match/clients.py`.
 ## Security and data handling
 
 - Keep API keys in environment variables or a server secret manager.
+- Do not commit `OPENAI_API_KEY` or put it in browser-visible source code.
 - Run API ingestion as a scheduled backend job.
 - Do not expose Scopus or Pure credentials in a website form.
 - Confirm Elsevier data retention and LLM-processing terms before sending

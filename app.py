@@ -11,6 +11,7 @@ import streamlit as st
 
 from funding_match.clients import utcnow
 from funding_match.db import connect, upsert
+from funding_match.llm import build_profiles_with_openai
 from funding_match.pipeline import (build_profiles, import_scopus_researcher,
                                     match_all, sync_grants)
 
@@ -36,9 +37,19 @@ def request_config(scopus_api_key="", simpler_grants_api_key=""):
     return config
 
 
+def server_setting(name, default=""):
+    """Read Streamlit Secrets first, then an environment variable."""
+    try:
+        value = st.secrets.get(name, "")
+    except (FileNotFoundError, KeyError):
+        value = ""
+    return str(value or os.environ.get(name, default)).strip()
+
+
 def run_match(profile, themes, use_scopus=False, max_publications=20,
               use_live_grants=False, funding_query="", seed_keywords=None,
-              scopus_api_key="", simpler_grants_api_key=""):
+              scopus_api_key="", simpler_grants_api_key="", use_llm=False,
+              openai_api_key="", openai_model="gpt-4o-mini"):
     """Run one isolated match without changing the command-line database."""
     with tempfile.TemporaryDirectory(prefix="funding-match-") as tmp:
         run_config = request_config(scopus_api_key, simpler_grants_api_key)
@@ -89,13 +100,32 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
 
         imported_publications = 0
         resolved_author_id = profile["scopus_author_id"]
+        system_warnings = []
+        theme_source = "Manually entered themes"
         if use_scopus:
             imported_publications, resolved_author_id = import_scopus_researcher(
                 conn, run_config, "web-form-researcher",
                 max_publications=max_publications, api_key=scopus_api_key)
-            build_profiles(
-                conn, max_themes=3, seed_keywords=seed_keywords,
-                researcher_id="web-form-researcher")
+            if use_llm and openai_api_key:
+                try:
+                    build_profiles_with_openai(
+                        conn, "web-form-researcher", openai_api_key,
+                        model=openai_model, seed_keywords=seed_keywords,
+                        max_themes=3)
+                    theme_source = f"OpenAI {openai_model}"
+                except Exception as exc:
+                    build_profiles(
+                        conn, max_themes=3, seed_keywords=seed_keywords,
+                        researcher_id="web-form-researcher")
+                    theme_source = "Local algorithm fallback"
+                    system_warnings.append(
+                        "OpenAI theme generation was unavailable, so the local "
+                        f"theme algorithm was used instead ({exc}).")
+            else:
+                build_profiles(
+                    conn, max_themes=3, seed_keywords=seed_keywords,
+                    researcher_id="web-form-researcher")
+                theme_source = "Local theme algorithm"
 
         funding_warning = None
 
@@ -128,6 +158,9 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                         "the included funding snapshot was used instead.")
         else:
             opportunity_count, funding_source = load_snapshot()
+        if funding_warning:
+            system_warnings.append(funding_warning)
+        warning_message = " ".join(system_warnings) or None
         conn.commit()
         match_all(conn)
 
@@ -158,6 +191,10 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
                 "populations": json.loads(theme["populations"] or "[]"),
                 "data_types": json.loads(theme["data_types"] or "[]"),
                 "evidence_papers": evidence_papers,
+                "generation_source": theme_source,
+                "generation_warning": next(
+                    (warning for warning in system_warnings
+                     if warning.startswith("OpenAI theme generation")), ""),
             })
 
         opportunity_rows = conn.execute("""
@@ -190,7 +227,7 @@ def run_match(profile, themes, use_scopus=False, max_publications=20,
         return ([dict(row) for row in opportunity_rows],
                 [dict(row) for row in theme_rows], funding_source,
                 imported_publications, resolved_author_id, opportunity_count,
-                funding_warning, generated_themes)
+                warning_message, generated_themes, theme_source)
 
 
 def render_results(rows, snapshot_date):
@@ -315,18 +352,23 @@ with st.expander("API access", expanded=True):
         "Keys entered here are used only for this browser session and are not "
         "saved to the repository or database. Leave blank to use server Secrets."
     )
-    api_col1, api_col2 = st.columns(2)
+    api_col1, api_col2, api_col3 = st.columns(3)
     with api_col1:
         scopus_key_input = st.text_input(
             "Scopus API key", type="password", key="session-scopus-key")
     with api_col2:
         grants_key_input = st.text_input(
             "Simpler.Grants.gov API key", type="password", key="session-grants-key")
+    with api_col3:
+        openai_key_input = st.text_input(
+            "OpenAI API key", type="password", key="session-openai-key")
 
 scopus_api_key = (scopus_key_input.strip()
-                  or os.environ.get("SCOPUS_API_KEY", "").strip())
+                  or server_setting("SCOPUS_API_KEY"))
 simpler_grants_api_key = (grants_key_input.strip()
-                          or os.environ.get("SIMPLER_GRANTS_API_KEY", "").strip())
+                          or server_setting("SIMPLER_GRANTS_API_KEY"))
+openai_api_key = openai_key_input.strip() or server_setting("OPENAI_API_KEY")
+openai_model = server_setting("OPENAI_MODEL", "gpt-4o-mini")
 
 profile_mode = st.radio(
     "Profile mode",
@@ -441,6 +483,27 @@ with st.container(border=True):
             "not imported or used in this mode."
         )
 
+    openai_ready = bool(openai_api_key)
+    if manual_theme_mode:
+        use_llm = False
+    else:
+        use_llm = st.checkbox(
+            "Use OpenAI to improve theme generation",
+            value=openai_ready,
+            disabled=not openai_ready,
+            key=f"use-openai-{mode_key}",
+            help=(
+                f"Uses {openai_model} and falls back to the local algorithm if needed."
+                if openai_ready else
+                "Enter an OpenAI API key above or configure Streamlit Secrets."
+            ),
+        )
+        if not openai_ready:
+            st.caption(
+                "Add an OpenAI API key to enable AI-enhanced themes; "
+                "local generation remains available."
+            )
+
     st.subheader("3. Research themes")
     entered_themes = []
     if manual_theme_mode:
@@ -473,6 +536,13 @@ with st.container(border=True):
                 })
     elif generated_theme_cache:
         st.caption("Themes generated during the latest search are shown below.")
+        st.caption(
+            "Theme generation: "
+            + generated_theme_cache[0].get("generation_source", "Unknown")
+        )
+        generation_warning = generated_theme_cache[0].get("generation_warning", "")
+        if generation_warning:
+            st.warning(generation_warning)
         for index, theme in enumerate(generated_theme_cache[:3], start=1):
             with st.expander(f"Theme {index}: {theme.get('name', '')}", expanded=True):
                 st.write(theme.get("summary", ""))
@@ -551,7 +621,7 @@ if submitted:
             with st.spinner(progress_message):
                 (opportunity_rows, theme_rows, snapshot_date, imported_count,
                  resolved_author_id, opportunity_count, funding_warning,
-                 generated_themes) = run_match(
+                 generated_themes, theme_source) = run_match(
                     profile, themes_for_match,
                     use_scopus=use_scopus and not manual_theme_mode,
                     max_publications=max_publications,
@@ -559,11 +629,14 @@ if submitted:
                     funding_query=funding_query.strip(),
                     seed_keywords=seed_keywords if keyword_guided_mode else None,
                     scopus_api_key=scopus_api_key,
-                    simpler_grants_api_key=simpler_grants_api_key)
+                    simpler_grants_api_key=simpler_grants_api_key,
+                    use_llm=use_llm,
+                    openai_api_key=openai_api_key,
+                    openai_model=openai_model)
             st.session_state["match_results"] = (
                 opportunity_rows, theme_rows, snapshot_date, top_k, minimum_fit,
                 imported_count, resolved_author_id, opportunity_count,
-                funding_warning)
+                funding_warning, theme_source)
             if not manual_theme_mode and generated_themes:
                 updated_store = dict(st.session_state.get("generated_themes", {}))
                 updated_store[theme_cache_key] = generated_themes[:3]
@@ -581,9 +654,12 @@ if submitted:
                 st.exception(exc)
 
 if "match_results" in st.session_state:
+    match_payload = st.session_state["match_results"]
+    if len(match_payload) == 9:
+        match_payload = (*match_payload, "Local theme algorithm")
     (result_rows, theme_rows, result_snapshot, result_top_k, result_minimum,
-     imported_count, resolved_author_id,
-     opportunity_count, funding_warning) = st.session_state["match_results"]
+     imported_count, resolved_author_id, opportunity_count,
+     funding_warning, theme_source) = match_payload
     if result_rows:
         if funding_warning:
             st.warning(funding_warning)
@@ -592,6 +668,7 @@ if "match_results" in st.session_state:
                 f"Imported {imported_count} Scopus publications "
                 f"(Author ID: {resolved_author_id})."
             )
+        st.caption(f"Theme generation: {theme_source}")
         st.caption(f"Funding source: {result_snapshot} · {opportunity_count} opportunities")
         theme_tab, opportunity_tab = st.tabs([
             "Top matches by research theme", "Best theme for each opportunity"
