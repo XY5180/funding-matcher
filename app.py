@@ -769,6 +769,52 @@ with st.container(border=True):
                     st.caption(
                         "Excluded as weak semantic outliers: " + "; ".join(
                             paper.get("title", "Untitled") for paper in excluded_papers))
+        import csv
+        import io
+        theme_export = []
+        for index, theme in enumerate(generated_theme_cache[:3], start=1):
+            papers = theme.get("evidence_papers", [])
+            excluded_papers = theme.get("excluded_papers", [])
+            theme_export.append({
+                "theme_number": index,
+                "theme_name": theme.get("name", ""),
+                "summary": theme.get("summary", ""),
+                "keywords": "; ".join(theme.get("keywords", [])),
+                "methods": "; ".join(theme.get("methods", [])),
+                "diseases_domains": "; ".join(theme.get("diseases", [])),
+                "populations": "; ".join(theme.get("populations", [])),
+                "data_types": "; ".join(theme.get("data_types", [])),
+                "supporting_paper_ids": "; ".join(
+                    str(paper.get("output_id", "")) for paper in papers),
+                "supporting_paper_titles": "; ".join(
+                    paper.get("title", "Untitled") for paper in papers),
+                "supporting_paper_dates": "; ".join(
+                    str(paper.get("publication_date") or "") for paper in papers),
+                "paper_theme_similarities": "; ".join(
+                    "" if paper.get("theme_similarity") is None
+                    else f"{float(paper['theme_similarity']):.1f}"
+                    for paper in papers),
+                "excluded_paper_titles": "; ".join(
+                    paper.get("title", "Untitled") for paper in excluded_papers),
+                "paper_coherence_score": theme.get("coherence_score"),
+                "theme_separation_score": theme.get("separation_score"),
+                "cluster_stability_score": theme.get("stability_score"),
+                "theme_quality_score": theme.get("quality_score"),
+                "quality_notes": theme.get("quality_notes", ""),
+                "generation_source": theme.get("generation_source", ""),
+            })
+        theme_output = io.StringIO()
+        theme_writer = csv.DictWriter(
+            theme_output, fieldnames=theme_export[0].keys())
+        theme_writer.writeheader()
+        theme_writer.writerows(theme_export)
+        st.download_button(
+            "Download generated themes as CSV",
+            theme_output.getvalue(),
+            file_name="generated_research_themes.csv",
+            mime="text/csv",
+            key=f"download-generated-themes-{theme_cache_key}",
+        )
     else:
         st.caption("The three generated themes and their supporting papers will appear here.")
 
