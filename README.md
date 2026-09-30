@@ -23,23 +23,6 @@ This creates:
 - `data/funding_match.db`
 - `output/demo_matches.csv`
 
-## Key-free preview using Xin Yuan's profile
-
-No API key is needed. The profile and a small, dated opportunity snapshot are
-plain JSON files so they can be reviewed before connecting institutional data.
-
-```bash
-python run_pipeline.py quick-xin-demo --reset
-```
-
-Open `output/xin_quick_report.html` for a readable ranked report, or use
-`output/xin_quick_matches.csv` for the best theme per opportunity and
-`output/xin_theme_matches.csv` for multiple opportunities per theme. Edit `quick_profile.json` to
-correct the profile. `quick_opportunities.json` is a 2026-09-25 snapshot from
-official announcement pages and must be re-checked before applying.
-
-Later, API sync replaces these two manual inputs; the matching and export
-stages stay the same.
 
 ## Web interface
 
